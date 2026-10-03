@@ -11,6 +11,7 @@ import {
   messageContent,
   toRelayConversation,
 } from "../../../shared/chatwoot/api.ts";
+import { parallel } from "../../../shared/concurrent.ts";
 import { parseJson } from "../../../shared/json.ts";
 import { errorFields, log } from "../../../shared/log.ts";
 import type { Settings } from "./config.ts";
@@ -189,8 +190,13 @@ export async function routeConversation(
     const current = await snapshot(initial.raw.inbox_id);
     if (!current) return;
     const latest = await readTurn(chatwoot, store, accountId, conversationId);
-    if (latest.boundary !== turn.boundary || inputs(latest.messages).key !== input.key) return "defer" as const;
-    return { ...current, handoff: latest.handoff || requiresHandoff(latest.messages) };
+    if (
+      latest.boundary !== turn.boundary ||
+      inputs(latest.messages).key !== input.key ||
+      inputs(latest.messages).text !== input.text
+    )
+      return "defer" as const;
+    return { ...current, pages: latest.pages, handoff: latest.handoff || requiresHandoff(latest.messages) };
   };
   const handoff = async (current?: Awaited<ReturnType<typeof fresh>>) => {
     requestHandoff(store, accountId, conversationId);
@@ -200,7 +206,12 @@ export async function routeConversation(
     return undefined;
   };
   if (turn.handoff || requiresHandoff(turn.messages) || input.count === 0) return handoff();
-  const memoKey = `decision:${accountId}:${conversationId}:${input.key}`;
+  const fingerprint = await crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(JSON.stringify({ text: input.text, routing })),
+  );
+  const hash = Array.from(new Uint8Array(fingerprint), (byte) => byte.toString(16).padStart(2, "0")).join("");
+  const memoKey = `decision:${accountId}:${conversationId}:${input.key}:${hash}`;
   const memo = decisionSchema.safeParse(parseJson(store.get(memoKey)));
   let decision = memo.success ? memo.data : undefined;
   if (!decision) {
@@ -211,6 +222,21 @@ export async function routeConversation(
   // A kind is actionable even when its text happens to look like a greeting.
   const assignee =
     decision.owner && decision.ownerConfidence >= routing.minConfidence ? owners[decision.owner]?.assignee : undefined;
+  const replyKey = `reply:${accountId}:${conversationId}`;
+  // Positive creation evidence is a permanent reply guard, including when the reply is later deleted.
+  if (
+    store.get(replyKey) === undefined &&
+    turn.pages.some((page) => page.some((message) => confirmedReply(message, botId)))
+  )
+    store.set(replyKey, "observed");
+  // Read-only preparation finishes before one fresh validation phase. Do not prefetch greetings.
+  const actionable = kind !== undefined || !decision.noRequest || input.count >= MAX_MESSAGES;
+  const [content, agents] = await parallel(
+    kind?.cannedResponse && store.get(replyKey) === undefined
+      ? chatwoot.cannedResponse(accountId, kind.cannedResponse)
+      : Promise.resolve(undefined),
+    actionable && assignee !== undefined && !kind?.status ? chatwoot.listAgents(accountId) : Promise.resolve(undefined),
+  );
   let current = await fresh();
   if (current === "defer" || !current) return current;
   if (current.handoff) return handoff(current);
@@ -229,12 +255,22 @@ export async function routeConversation(
       ...[topic, kind ? decision.kind : null].filter((label) => label !== null),
     ]),
   ];
-  if (labels.length !== current.conversation.labels.length) await bot.setLabels(accountId, conversationId, labels);
-  const replyKey = `reply:${accountId}:${conversationId}`;
+  let changed = false;
+  if (labels.length !== current.conversation.labels.length) {
+    await bot.setLabels(accountId, conversationId, labels);
+    changed = true;
+  }
   if (kind?.cannedResponse) {
     let history: Awaited<ReturnType<typeof replyHistory>>;
     try {
-      history = await replyHistory(chatwoot, accountId, conversationId, botId);
+      // Never reuse pages across a mutation. Fresh phase pages include history beyond its boundary.
+      if (changed) {
+        current = await fresh();
+        if (current === "defer" || !current) return current;
+        if (current.handoff) return handoff(current);
+        changed = false;
+      }
+      history = await replyHistory(chatwoot, accountId, conversationId, botId, current.pages);
     } catch (error) {
       log.warn("reply history unavailable; handing off", { accountId, conversationId, ...errorFields(error) });
       return handoff();
@@ -243,7 +279,6 @@ export async function routeConversation(
     // Preserve the once-per-conversation guard even if an observed historical reply is later removed.
     if (history === "found" && store.get(replyKey) === undefined) store.set(replyKey, "observed");
     if (history === "complete-none") {
-      const content = await chatwoot.cannedResponse(accountId, kind.cannedResponse);
       if (!content?.trim()) return handoff();
       current = await fresh();
       if (current === "defer" || !current) return current;
@@ -252,6 +287,7 @@ export async function routeConversation(
       try {
         const message = await bot.createMessage(accountId, conversationId, { content, private: false, files: [] });
         if (!confirmedReply(message, botId) || message?.conversation_id !== conversationId) return handoff();
+        changed = true;
       } catch (error) {
         log.warn("reply creation unconfirmed; handing off", { accountId, conversationId, ...errorFields(error) });
         return handoff();
@@ -260,12 +296,13 @@ export async function routeConversation(
   }
   if (assignee !== undefined && !kind?.status) {
     // AssignmentService silently assigns nobody for a user outside this account.
-    const agents = await chatwoot.listAgents(accountId);
-    if (!agents.some((agent) => agent.id === assignee)) return handoff();
+    if (!agents?.some((agent) => agent.id === assignee)) return handoff();
   }
-  current = await fresh();
-  if (current === "defer" || !current) return current;
-  if (current.handoff) return handoff(current);
+  if (changed) {
+    current = await fresh();
+    if (current === "defer" || !current) return current;
+    if (current.handoff) return handoff(current);
+  }
   if (kind?.status) {
     await bot.setStatus(accountId, conversationId, { status: kind.status });
     expectActivity(store, accountId, conversationId, { status: kind.status });
@@ -352,7 +389,10 @@ async function decide(ctx: RoutingContext, owners: Owners, kinds: Kinds | undefi
       body: JSON.stringify({ model: routing.model, state: { ticket: text }, questions }),
     }),
   );
-  if (!response.ok) throw new JevError(`HTTP ${response.status}`);
+  if (!response.ok) {
+    await response.body?.cancel();
+    throw new JevError(`HTTP ${response.status}`);
+  }
   const parsed = jevResponseSchema.safeParse(await response.json().catch(() => undefined));
   if (!parsed.success) throw new JevError("invalid response");
 

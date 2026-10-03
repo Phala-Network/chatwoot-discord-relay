@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Bound Hub work with per-operation deadlines and persisted continuations. Persist rate-limit cooldowns without sleeping, page hourly digests, prioritize live messages with aging, and refresh decorative metadata outside the message path.
+- Separate command execution from retryable feedback and card convergence; retain unknown send outcomes without replay. Use one bounded durable interaction RPC and only persisted drafts for modals. Keep the deployed Hub namespace, cursor and hold state intact; the attachment table and assignee-notice receipt column are added without moving existing state.
 - Simplify the native-status design: inline the relay-only sweep continuation, remove its one-page loop and thin
   alarm, payload, escalation, panel and notice wrappers. Keep pending holding, answering-reply pagination, queue
   pings and Discord effects unchanged; log unavailable failure notices.

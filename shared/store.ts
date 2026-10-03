@@ -77,7 +77,8 @@ export class QueueStore {
     const row = this.sql
       .exec<{ key: string; payload: string; version: number; attempts: number; created_at: number }>(
         `SELECT key, payload, version, attempts, created_at FROM jobs WHERE suspended != 2 AND not_before <= ?
-         ORDER BY priority, not_before, created_at LIMIT 1`,
+         ORDER BY MAX(0, priority - CAST((? - created_at) / 30000 AS INTEGER)), not_before, created_at LIMIT 1`,
+        this.now(),
         this.now(),
       )
       .toArray()[0];

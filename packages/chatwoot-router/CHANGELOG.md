@@ -22,6 +22,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Reuse message pages only within one fresh phase, combine independent read-only preparation, and scope decisions to actual input/configuration without weakening side-effect checks.
+- Partition routing by account and conversation, with a separate paged sweep coordinator. No state migration is needed: 0.2.x was never deployed. Preserve each conversation namespace and its reply/turn guards for future upgrades.
 - Remove cached inbox discovery, obsolete lifecycle cleanup/coordination effects and the single-use decision reader.
   Keep bounded turn/history reads and the existing 45-request budget.
 - Document relay-first bootstrap, disconnect-and-drain rollback to the recorded live 0.27 version/config, and the

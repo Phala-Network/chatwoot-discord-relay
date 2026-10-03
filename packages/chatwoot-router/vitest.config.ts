@@ -9,7 +9,10 @@ export default defineConfig({
       miniflare: {
         compatibilityDate: "2026-08-15",
         compatibilityFlags: ["nodejs_compat"],
-        durableObjects: { ROUTER: { className: "Router", useSQLite: true } },
+        durableObjects: {
+          ROUTER: { className: "Router", useSQLite: true },
+          COORDINATOR: { className: "Coordinator", useSQLite: true },
+        },
         kvNamespaces: ["CONFIG_STORE"],
         bindings: {
           CONFIG: {

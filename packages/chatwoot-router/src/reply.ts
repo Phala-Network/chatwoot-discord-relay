@@ -21,11 +21,14 @@ export async function replyHistory(
   accountId: number,
   conversationId: number,
   botId: number | undefined,
+  freshPages: readonly ChatwootMessage[][] = [],
 ): Promise<"found" | "complete-none" | "unknown"> {
   let before: number | undefined;
   for (let page = 0; page < 5; page += 1) {
     // Read failures propagate to the caller, which persists handoff before trying it.
-    const messages = await chatwoot.listMessages(accountId, conversationId, before === undefined ? {} : { before });
+    const messages =
+      freshPages[page] ??
+      (await chatwoot.listMessages(accountId, conversationId, before === undefined ? {} : { before }));
     for (const message of messages) {
       if (confirmedReply(message, botId)) return "found";
       if (message.message_type !== 1 || message.private === true) continue;

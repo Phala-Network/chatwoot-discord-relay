@@ -27,31 +27,41 @@ answered directly; the rest are deferred.
 `src/hub.ts`, with SQLite. One object holds all state (conversation → post mapping and cursor, the
 Discord message ids posted per Chatwoot message, posted responses, the job queue, triage
 counters, a small cache) and does all work from its alarm. One object keeps work serialized per
-conversation and makes the triage budget and post lookups coordination-free; support volumes are
-far below its throughput.
+conversation and keeps triage budgets and post lookups under one writer. Bounded operations and
+persisted continuations allow other due jobs to run between time slices.
 
-Jobs run by priority (commands first), failures retry with exponential backoff (5 s … 30 min),
-and a run yields before the subrequest limit. A job that Discord rate limits waits as long as
-Discord asks, without counting an attempt. A command runs at most once: it is not retried, since
-running it again could, for example, send a reply twice, and one that could not start while
-Discord's 15-minute interaction window left time to report is answered that nothing was done.
-Background jobs (syncing posts, the sweep) retry until they succeed: after a few
-failures a job's log turns into errors, and it keeps retrying at most every 30 minutes, so an
-outage of any length loses no background work. The support queue is the exception: it posts
-nothing after its first three minutes (Discord's nonce, which keeps a retried post from appearing
-twice, lasts only a few minutes; the next hour's queue lists the same tickets). Every outbound
-request times out after 60 seconds, which counts as a failed attempt. While a conversation's job
-is backing off, new events for it wait for its next attempt.
+Confirmed command feedback runs first, then commands, live messages and immediate card updates, then sweep
+pages and the hourly digest. Waiting jobs gain one priority level every 30 seconds, so background
+reconciliation progresses under sustained live traffic. Every job has a 10-second time slice and
+an invocation-wide subrequest budget. Metadata reads/writes time out after 1.5 seconds;
+attachment transfers after 8 seconds, including response bodies. The operation, caller and job
+signals are composed. A command reserves the full operation deadline before beginning a mutation.
+Safe preparation and completed attachments continue durably; a started action with no confirmed
+result stays unknown and is never replayed.
+
+Discord bucket limits include their major resource and auth scope. Bot global, unauthenticated
+global and interaction routes are distinct: interaction feedback is outside the bot global limit.
+Discord and Chatwoot Retry-After become persisted not-before times, without sleeps or retries
+inside an alarm. Confirmed failures back off (5 s … 30 min). New events preserve failure backoff.
+The hourly digest reads at most two independent pages per job and persists progress and its hourly
+snapshot. Its three-minute deadline is checked before each read and send; successful parts and
+escalation commits survive retries with the original nonces.
 
 ## Relaying
 
-`src/relay/`. A webhook only queues "sync conversation N" (conversation events wait 10 seconds
-first, for Chatwoot to create the change's activity message, which sends no webhook). The job
+`src/relay/`. Conversation events queue an immediate live status/card sync and a separate
+conversation job delayed 10 seconds for Chatwoot's asynchronous activity message. Pending customer
+messages retain their hold and one race re-read. Inbox names and avatars come from a display-only
+cache; misses enqueue a low-priority refresh with a 300 ms deadline and fallback. The job
 fetches the conversation and the messages after its cursor, posts them in order, then corrects
 tags and the archived flag once. Each Discord message is recorded as soon as it is accepted and
 the cursor moves past a Chatwoot message once all its parts are posted, so duplicate, reordered,
-or lost webhooks cause no duplicate or missing posts. The one remaining way to post twice is a
-request Discord accepted whose response never arrived: Execute Webhook has no idempotency key.
+or lost webhooks resume after recorded parts. Before a message, notice, derived response or new post is sent,
+a permanent attempt guard is written. Execute Webhook has no idempotency key: a lost receipt stays
+unknown and cannot automatically replay that send. Known receipts are retained for recovery.
+Derived responses use a revision per source message, so a customer changing a rating back is a
+new response. Assignee notices commit before the best-effort member update. A deadline reached
+before dispatch permits continuation; a timeout after dispatch preserves the unknown outcome.
 
 ## Sweep
 
@@ -80,8 +90,10 @@ ones (for example an import of history): keep such an import in an inbox the rel
 
 ## Commands
 
-`src/commands/`. Deferred commands run at most once, never retried, so a reply is never sent
-twice; a repeated interaction is refused (see the [security model](../README.md#security-model)).
+`src/commands/`. A command separates safe preparation, an at-most-once action and a durable
+result. Interaction feedback and live card convergence are independent retryable jobs; neither
+can re-execute the Chatwoot action. Panel rendering is feedback preparation after a confirmed
+result. A repeated interaction is refused (see the [security model](../README.md#security-model)).
 One that cannot start within 12 minutes is dropped, because Discord's interaction token (valid 15
 minutes) could soon no longer report its result, and the invoker is told that nothing was done.
 

@@ -146,9 +146,22 @@ Design choices:
   per conversation and `triage.perHour` (30) in total call the agent each hour; beyond that a
   visible note replaces the mention, as it does on a customer message a routing kind's reply
   already answered. Messages from blocked contacts are never relayed.
+- **Bounded background work.** Each job has a 10-second slice; metadata requests have a 1.5-second deadline,
+  uploads/downloads 8 seconds, including response bodies and the job's signal. Completed message parts,
+  history cursors, downloaded command attachments and digest pages persist before continuation. Unknown
+  sends are retained and never automatically replayed. Commands durably record their attempt and confirmed
+  result; feedback PATCH and live card convergence run as separate retryable jobs.
+  Discord bucket/major-resource and global cooldowns, and Chatwoot Retry-After, persist across alarms without
+  sleeping. Interaction feedback is outside the bot global limit. New messages precede sweep pages;
+  waiting jobs gain priority every 30 seconds. The hourly digest reads two independent pages at a time and
+  checks its three-minute deadline before reading or posting. Status/card updates are immediate, while
+  activity lines retain their delayed completion and pending messages retain their hold.
+  Inbox names and avatars use cache-aside refresh jobs with a 300 ms deadline and fallback; they never
+  occupy the customer body's path. Initial interactions have one 2.5-second budget and one durable Hub RPC.
+  An unconfirmed enqueue returns HTTP 503, never a premature Discord acknowledgement.
 - **Reliable by construction.** Chatwoot sends each webhook once, without retry, so webhooks are
   only triggers: the Worker queues the work durably in one Durable Object, which reads Chatwoot's
-  API, retries failed work until it succeeds, and sweeps every 5 minutes for missed messages and conversation state
+  API, retries confirmed failures, and sweeps every 5 minutes for missed messages and conversation state
   ([Internals](https://github.com/Phala-Network/chatwoot-workers/blob/main/packages/chatwoot-discord-relay/docs/internals.md) says what the sweep does not cover).
 
 ## Deploy
@@ -311,7 +324,7 @@ working, and the commands work everywhere.
 | Command | Card button | Effect in Chatwoot |
 |---|---|---|
 | `/reply [message] [attachment]` | **Write reply** | Without options, an editor with a message field and an optional upload field; with either option, sends it at once. Sends to the customer; an unassigned conversation is assigned to the sender. Refused when the channel does not accept a reply (Chatwoot's `can_reply`, e.g. after WhatsApp's 24-hour window). With `chatwoot.sendAsAgent`, the editor's **Send from my email address** sends an email reply from the agent's own mailbox name on the inbox's domain (alice@corp.example answering support@acme.example sends as alice@acme.example); it needs a Chatwoot build that reads `content_attributes.send_as_agent` ([Phala-Network/chatwoot](https://github.com/Phala-Network/chatwoot), `phala/*` branches), so it is off by default. |
-| Apps → **Reply with this** (message menu) | **Reply with draft** | The `/reply` editor, prefilled. **Reply with this**: from the triage bot, the last code block of its message (none: no draft); from anyone else, the last code block or the whole message. **Reply with draft**: the draft the hook sent, or else the answer's last code block read from Discord, which needs the Message Content intent; without it, it links to the answer for **Reply with this**. |
+| Apps → **Reply with this** (message menu) | **Reply with draft** | The `/reply` editor, prefilled. **Reply with this**: from the triage bot, the last code block of its message (none: no draft); from anyone else, the last code block or the whole message. **Reply with draft**: the persisted draft the hook sent; a missing draft links to the answer for **Reply with this**, without an upstream read while Discord waits for the modal. |
 | `/note [message] [attachment]` | | Like `/reply`, for a private note. |
 | `/resolve`, `/reopen` | **Resolve**, **Reopen** | Change the status. |
 | `/pending` | | Hand back to the inbox bot; ordinary pending status when no bot is linked. |

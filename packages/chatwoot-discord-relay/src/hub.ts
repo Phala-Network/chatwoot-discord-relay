@@ -9,6 +9,7 @@
 
 import { DurableObject } from "cloudflare:workers";
 import {
+  type APIInteraction,
   type APIMessageTopLevelComponent,
   ComponentType,
   MessageFlags,
@@ -17,22 +18,36 @@ import {
   Routes,
 } from "discord-api-types/v10";
 import { z } from "zod";
-import { Budget, BudgetExhaustedError } from "../../../shared/budget.ts";
-import { chatwootClient, toRelayConversation } from "../../../shared/chatwoot/api.ts";
+import { scheduleAlarm } from "../../../shared/alarm.ts";
+import {
+  Budget,
+  BudgetExhaustedError,
+  JobDeadlineError,
+  METADATA_TIMEOUT_MS,
+  TRANSFER_TIMEOUT_MS,
+} from "../../../shared/budget.ts";
+import { ChatwootError, chatwootClient, toRelayConversation } from "../../../shared/chatwoot/api.ts";
 import { parseJson } from "../../../shared/json.ts";
 import { errorFields, log } from "../../../shared/log.ts";
 import { retryDelay } from "../../../shared/store.ts";
-import { executeCommand } from "./commands/actions.ts";
+import { type CommandExecution, commandPanel, executeCommand, statusMessage } from "./commands/actions.ts";
+import { downloadAttachment } from "./commands/attachments.ts";
+import { UNKNOWN_RESULT } from "./commands/common.ts";
 import { text } from "./commands/components.ts";
-import { type CommandJob, commandJobSchema } from "./commands/job.ts";
+import { type HandlerResult, handleInteraction } from "./commands/handler.ts";
+import { type CommandAction, type CommandJob, commandJobSchema } from "./commands/job.ts";
 import { relaysInbox, type Settings } from "./config.ts";
 import { DiscordForum } from "./discord/forum.ts";
 import { DiscordHttpError, DiscordRest } from "./discord/rest.ts";
 import type { Env } from "./env.ts";
 import { postQueue } from "./queue.ts";
-import { queueBudget } from "./queue-limits.ts";
-import { latestMessageId, type ProcessorContext, processConversation, relayFor } from "./relay/processor.ts";
-import { isUnknownCard } from "./relay/relay.ts";
+import {
+  latestMessageId,
+  type ProcessorContext,
+  processConversation,
+  refreshMetadata,
+  relayFor,
+} from "./relay/processor.ts";
 import { processMessageUpdate } from "./relay/updates.ts";
 import { loadSettings } from "./settings.ts";
 import { type Job, Store } from "./store.ts";
@@ -40,8 +55,26 @@ import { type Job, Store } from "./store.ts";
 export const HUB_NAME = "global";
 
 const id = z.number().int().positive();
+const resultSchema = z.object({
+  content: z.string(),
+  conversationGone: z.boolean(),
+  confirmed: z.boolean().optional(),
+  components: z
+    .array(
+      z.custom<APIMessageTopLevelComponent>((value) => typeof value === "object" && value !== null && "type" in value),
+    )
+    .optional(),
+});
 const payloadSchema = z.discriminatedUnion("type", [
   z.object({ type: z.literal("command"), job: commandJobSchema }),
+  z.object({ type: z.literal("feedback"), job: commandJobSchema, result: resultSchema, expiresAt: z.number() }),
+  z.object({ type: z.literal("sync"), accountId: id, conversationId: id }),
+  z.object({
+    type: z.literal("metadata"),
+    accountId: id,
+    inboxId: id.optional(),
+    discordUserId: z.string().optional(),
+  }),
   z.object({ type: z.literal("sweep"), accountId: id }),
   z.object({ type: z.literal("conversation"), accountId: id, conversationId: id }),
   z.object({ type: z.literal("message-updated"), accountId: id, conversationId: id, messageId: id }),
@@ -51,12 +84,15 @@ const payloadSchema = z.discriminatedUnion("type", [
 type JobPayload = z.infer<typeof payloadSchema>;
 
 const PRIORITY = {
-  command: 0,
-  answer: 1,
-  sweep: 1,
+  command: 1,
+  answer: 2,
+  feedback: 0,
+  sync: 2,
   conversation: 2,
-  "message-updated": 3,
+  "message-updated": 2,
+  sweep: 3,
   queue: 4,
+  metadata: 5,
 } as const;
 /** Requests a job may need before it can start without being cut short. */
 const COMMAND_BUDGET = 20;
@@ -99,7 +135,8 @@ export class Hub extends DurableObject<Env> {
    */
   async enqueueConversation(accountId: number, conversationId: number, delayMs = 0): Promise<void> {
     this.enqueue({ type: "conversation", accountId, conversationId }, Date.now() + delayMs);
-    await this.schedule();
+    if (delayMs > 0) this.enqueue({ type: "sync", accountId, conversationId });
+    await scheduleAlarm(this.ctx, this.store.nextWakeup());
   }
 
   /**
@@ -112,7 +149,21 @@ export class Hub extends DurableObject<Env> {
       this.enqueue({ type: "conversation", accountId, conversationId });
     }
     this.enqueue({ type: "message-updated", accountId, conversationId, messageId });
-    await this.schedule();
+    await scheduleAlarm(this.ctx, this.store.nextWakeup());
+  }
+
+  async interaction(interaction: APIInteraction): Promise<HandlerResult["response"]> {
+    const settings = await loadSettings(this.env);
+    const result = await handleInteraction(interaction, {
+      settings,
+      ticketForThread: async (threadId) => this.store.ticketForThread(threadId),
+      draftOf: async (_threadId, answerId) => {
+        const draft = this.store.get(answerKey(answerId));
+        return draft === undefined ? { missing: "unreadable" as const } : { text: draft };
+      },
+    });
+    if (result.job) await this.enqueueCommand(result.job);
+    return result.response;
   }
 
   /** Queues a command once per interaction: a repeated (replayed) request is ignored. */
@@ -122,7 +173,7 @@ export class Hub extends DurableObject<Env> {
       return;
     }
     this.enqueue({ type: "command", job });
-    await this.schedule();
+    await scheduleAlarm(this.ctx, this.store.nextWakeup());
   }
 
   /** Queues a reconciliation sweep for every configured account (called by the cron trigger). */
@@ -130,14 +181,14 @@ export class Hub extends DurableObject<Env> {
     this.store.wakeHeldJobs();
     for (const account of (await loadSettings(this.env)).config.accounts)
       this.enqueue({ type: "sweep", accountId: account.id });
-    await this.schedule();
+    await scheduleAlarm(this.ctx, this.store.nextWakeup());
   }
 
   /** Queues the hourly support queue, if configured (called by the cron trigger at minute 0). */
   async requestQueue(): Promise<void> {
     if (!(await loadSettings(this.env)).config.queue) return;
     this.enqueue({ type: "queue" });
-    await this.schedule();
+    await scheduleAlarm(this.ctx, this.store.nextWakeup());
   }
 
   /**
@@ -150,12 +201,7 @@ export class Hub extends DurableObject<Env> {
     if (!ticket || this.store.get(answerKey(answerId)) !== undefined) return;
     this.store.set(answerKey(answerId), draft, ANSWER_TTL_MS);
     this.enqueue({ type: "answer", ...ticket, answerId, replyTo });
-    await this.schedule();
-  }
-
-  /** The draft the triage bot's hook sent with an answer, while it is kept. */
-  async answerDraft(answerId: string): Promise<string | null> {
-    return this.store.get(answerKey(answerId)) ?? null;
+    await scheduleAlarm(this.ctx, this.store.nextWakeup());
   }
 
   async ticketForThread(threadId: string): Promise<{ accountId: number; conversationId: number } | null> {
@@ -179,10 +225,11 @@ export class Hub extends DurableObject<Env> {
         continue;
       }
       const payload = parsed.data;
-      if (budget.remaining < requiredBudget(payload, settings) || Date.now() - startedAt > RUN_WALL_MS) {
+      if (budget.remaining < requiredBudget(payload) || Date.now() - startedAt > RUN_WALL_MS) {
         yielded = true;
         break;
       }
+      budget.startSlice();
       const jobStarted = Date.now();
       const outcome = await this.run(job, payload, services);
       const ms = Date.now() - jobStarted;
@@ -193,27 +240,73 @@ export class Hub extends DurableObject<Env> {
         break;
       }
     }
-    await this.schedule(yielded ? Date.now() : undefined);
+    await scheduleAlarm(this.ctx, yielded ? Date.now() : this.store.nextWakeup());
   }
 
   private async run(job: Job, payload: JobPayload, services: ProcessorContext): Promise<"done" | "yield"> {
     try {
       switch (payload.type) {
-        case "command":
-          // At most once: a command that sends a message must never run twice.
-          this.store.deleteJob(job.key);
-          if (Date.now() - job.createdAt > COMMAND_START_DEADLINE_MS) {
-            log.warn("command expired before it could run; dropped", {
-              interactionId: payload.job.interactionId,
-              action: payload.job.action.type,
+        case "command": {
+          const saved = resultSchema.safeParse(
+            parseJson(this.store.get(`command:${payload.job.interactionId}:result`)),
+          );
+          const attempted = this.store.get(`command:${payload.job.interactionId}:started`) !== undefined;
+          const result = saved.success
+            ? saved.data
+            : attempted
+              ? { content: UNKNOWN_RESULT, conversationGone: false }
+              : Date.now() - job.createdAt > COMMAND_START_DEADLINE_MS
+                ? { content: EXPIRED, conversationGone: false }
+                : await this.runCommand(payload.job, services);
+          this.store.set(`command:${payload.job.interactionId}:result`, JSON.stringify(result), 60 * 60 * 1000);
+          this.enqueue({ type: "feedback", job: payload.job, result, expiresAt: job.createdAt + 15 * 60 * 1000 });
+          if (result.conversationGone)
+            this.enqueue({
+              type: "conversation",
+              accountId: payload.job.accountId,
+              conversationId: payload.job.conversationId,
             });
-            await respond(services.rest, payload.job, EXPIRED);
-            return "done";
+          else if (result.content !== EXPIRED && !READ_ONLY_ACTIONS.has(payload.job.action.type))
+            this.enqueue({
+              type: "sync",
+              accountId: payload.job.accountId,
+              conversationId: payload.job.conversationId,
+            });
+          this.store.clearCommandFiles(payload.job.interactionId);
+          this.store.completeJob(job);
+          return "done";
+        }
+        case "feedback": {
+          if (Date.now() < payload.expiresAt) {
+            await respond(services.rest, payload.job, payload.result.content, payload.result.components);
+            if (payload.result.confirmed === true && !payload.result.components) {
+              try {
+                const components = await commandPanel(
+                  payload.job,
+                  payload.result,
+                  services.settings,
+                  services.budget.fetch,
+                  this.store,
+                );
+                if (components) await respond(services.rest, payload.job, payload.result.content, components);
+              } catch (error) {
+                log.warn("optional command panel failed", {
+                  interactionId: payload.job.interactionId,
+                  ...errorFields(error),
+                });
+              }
+            }
           }
-          if (Date.now() - job.createdAt > SLOW_JOB_MS) {
-            log.warn("command waited", { interactionId: payload.job.interactionId, ms: Date.now() - job.createdAt });
-          }
-          await this.runCommand(payload.job, services);
+          this.store.completeJob(job);
+          return "done";
+        }
+        case "sync":
+          await this.syncAfterCommand(payload, services);
+          this.store.completeJob(job);
+          return "done";
+        case "metadata":
+          await refreshMetadata(services, payload);
+          this.store.completeJob(job);
           return "done";
         case "sweep":
           await this.sweep(payload.accountId, services);
@@ -237,7 +330,7 @@ export class Hub extends DurableObject<Env> {
           // is retried or deferred, nothing is posted after that, so the queue and its pings are
           // never posted twice (the next hour's queue lists the same tickets). The run keeps the
           // job's time, so every attempt posts the same messages with the same nonces.
-          await postQueue(services, job.createdAt, job.createdAt + QUEUE_RETRY_MS);
+          if ((await postQueue(services, job.createdAt, job.createdAt + QUEUE_RETRY_MS)) === "yield") return "yield";
           this.store.completeJob(job);
           return "done";
         case "answer":
@@ -248,13 +341,13 @@ export class Hub extends DurableObject<Env> {
           return "done";
       }
     } catch (error) {
-      if (error instanceof BudgetExhaustedError) return "yield";
+      if (error instanceof BudgetExhaustedError || error instanceof JobDeadlineError) return "yield";
       const backoff = retryDelay(job.attempts);
-      if (error instanceof DiscordHttpError && error.retryAfterMs !== undefined) {
+      if ((error instanceof DiscordHttpError || error instanceof ChatwootError) && error.retryAfterMs !== undefined) {
         // Rate limited: wait as long as Discord asks without counting an attempt, so no rate
         // limit, however long, drops the job.
-        const delay = Math.max(backoff, error.retryAfterMs);
-        log.warn("job rate limited by Discord; will retry", { job: job.key, delayMs: delay });
+        const delay = error.retryAfterMs;
+        log.warn("job rate limited; will retry", { job: job.key, delayMs: delay });
         this.store.deferJob(job, delay);
         return "done";
       }
@@ -271,35 +364,139 @@ export class Hub extends DurableObject<Env> {
     }
   }
 
-  private async runCommand(job: CommandJob, services: ProcessorContext): Promise<void> {
-    const { content, components, conversationGone } = await executeCommand(
-      job,
-      services.settings,
-      services.budget.fetch,
-    );
-    // Chatwoot sends no webhook when a conversation is deleted: let its job close the post.
-    if (conversationGone)
-      this.enqueue({ type: "conversation", accountId: job.accountId, conversationId: job.conversationId });
-    await respond(services.rest, job, content, components);
-    if (!conversationGone && !READ_ONLY_ACTIONS.has(job.action.type)) await this.syncAfterCommand(job, services);
+  private async runCommand(job: CommandJob, services: ProcessorContext) {
+    const key = `command:${job.interactionId}:started`;
+    const token = services.settings.agentToken(job.discordUserId);
+    let beforeLabels: string[] | undefined;
+    if (token && ["label", "labels"].includes(job.action.type)) {
+      const beforeClient = chatwootClient(
+        services.settings.config.chatwoot.baseUrl,
+        token,
+        services.budget.fetchWith(METADATA_TIMEOUT_MS),
+        this.store,
+      );
+      const before = await beforeClient.getConversation(job.accountId, job.conversationId);
+      if (before) beforeLabels = await beforeClient.conversationLabels(job.accountId, job.conversationId);
+    }
+    let confirmed = false;
+    const fetch = async (request: Request) => {
+      services.budget.checkpoint();
+      if (services.budget.remaining < 1) throw new BudgetExhaustedError();
+      const mutation = request.method !== "GET" && request.method !== "HEAD";
+      if (mutation) {
+        services.budget.requireTime(
+          request.headers.get("content-type")?.startsWith("multipart/form-data")
+            ? TRANSFER_TIMEOUT_MS
+            : METADATA_TIMEOUT_MS,
+        );
+        this.store.set(key, "unknown", 60 * 60 * 1000);
+      }
+      const response = await services.budget.fetchWith(
+        request.headers.get("content-type")?.startsWith("multipart/form-data")
+          ? TRANSFER_TIMEOUT_MS
+          : METADATA_TIMEOUT_MS,
+      )(request);
+      if (mutation && response.status === 429 && !confirmed) this.store.delete(key);
+      if (mutation && response.ok) confirmed = true;
+      return response;
+    };
+    const execution: CommandExecution = {
+      settings: services.settings,
+      fetch,
+      limits: this.store,
+      retryable: () => this.store.get(key) === undefined,
+      confirmUnknown: (chatwoot, action) =>
+        this.confirmUnknownCommand(chatwoot, job, action, services.settings, beforeLabels),
+      deferPanel: true,
+      attachment: async (action, index) => {
+        const file = action.files[index];
+        if (!file) throw new Error("Missing command attachment");
+        services.budget.checkpoint();
+        const cached = this.store.commandFile(job.interactionId, index, file.contentType || "application/octet-stream");
+        if (cached) return { blob: cached, filename: file.filename || "attachment" };
+        const downloaded = await downloadAttachment(
+          file,
+          services.settings.config.attachments.maxFileBytes,
+          services.budget.fetchWith(TRANSFER_TIMEOUT_MS),
+        );
+        await this.store.saveCommandFile(job.interactionId, index, downloaded.blob);
+        return downloaded;
+      },
+    };
+    return executeCommand(job, execution);
   }
 
-  /**
-   * Brings the post's tags and card in line right after a command, rather than with Chatwoot's
-   * event for the change, whose job waits for the change's activity line (see ACTIVITY_WAIT_MS)
-   * and then posts it, moving the card under it. Best effort: should this fail or run out of
-   * budget, that job does it.
-   */
-  private async syncAfterCommand(job: CommandJob, { chatwoot, relay }: ProcessorContext): Promise<void> {
+  private async confirmUnknownCommand(
+    chatwoot: ReturnType<typeof chatwootClient>,
+    job: CommandJob,
+    action: CommandAction,
+    settings: Settings,
+    beforeLabels: string[] | undefined,
+  ): Promise<string | undefined> {
+    try {
+      const conversation = await chatwoot.getConversation(job.accountId, job.conversationId);
+      if (!conversation) return undefined;
+      switch (action.type) {
+        case "status":
+          if (action.status === "pending" && conversation.inbox_id !== undefined) {
+            const bot = await chatwoot.inboxBot(job.accountId, conversation.inbox_id);
+            if (bot) {
+              if (conversation.meta?.assignee_type !== "AgentBot" || conversation.meta.assignee?.id !== bot.id)
+                return undefined;
+              return "Handed back to the inbox bot.";
+            }
+          }
+          if (String(conversation.status) !== action.status) return undefined;
+          if (action.status === "snoozed" && (conversation.snoozed_until ?? undefined) !== action.snoozedUntil)
+            return undefined;
+          return statusMessage(action.status, action.snoozedUntil);
+        case "priority":
+          if (conversation.priority === action.priority)
+            return action.priority ? `Priority set to ${action.priority}.` : "Priority removed.";
+          return undefined;
+        case "assign":
+          if (conversation.meta?.assignee?.id === action.chatwootUserId && conversation.meta?.assignee_type === "User")
+            return `Assigned to the agent.`;
+          return undefined;
+        case "unassign":
+          return conversation.meta?.assignee ? undefined : "Unassigned.";
+        case "label": {
+          if (beforeLabels === undefined) return undefined;
+          const labels = await chatwoot.conversationLabels(job.accountId, job.conversationId);
+          const expected =
+            action.change === "add"
+              ? [...new Set([...beforeLabels, action.label])]
+              : beforeLabels.filter((label) => label !== action.label);
+          if (sameLabels(labels, expected))
+            return action.change === "add" ? `Label ${action.label} added.` : `Label ${action.label} removed.`;
+          return undefined;
+        }
+        case "labels": {
+          if (beforeLabels === undefined) return undefined;
+          const labels = await chatwoot.conversationLabels(job.accountId, job.conversationId);
+          const kinds = new Set(settings.config.router?.keepLabels ?? []);
+          const expected = [...new Set([...action.labels, ...beforeLabels.filter((label) => kinds.has(label))])];
+          if (sameLabels(labels, expected))
+            return action.labels.length > 0 ? `Label set to ${action.labels.join(", ")}.` : "Labels removed.";
+          return undefined;
+        }
+        default:
+          return undefined;
+      }
+    } catch {
+      return undefined;
+    }
+  }
+
+  private async syncAfterCommand(
+    job: { accountId: number; conversationId: number },
+    { chatwoot, relay }: ProcessorContext,
+  ): Promise<void> {
     const { accountId, conversationId } = job;
     const threadId = this.store.conversation(accountId, conversationId)?.threadId;
     if (!threadId) return;
-    try {
-      const conversation = await chatwoot.getConversation(accountId, conversationId);
-      if (conversation) await relay.sync(accountId, toRelayConversation(conversationId, conversation), threadId);
-    } catch (error) {
-      log.warn("post not synced after command", { accountId, conversationId, ...errorFields(error) });
-    }
+    const conversation = await chatwoot.getConversation(accountId, conversationId);
+    if (conversation) await relay.sync(accountId, toRelayConversation(conversationId, conversation), threadId);
   }
 
   /**
@@ -343,9 +540,7 @@ export class Hub extends DurableObject<Env> {
       const behind = needsCursor || (latest !== undefined && latest > cursor);
       const stale =
         row?.threadId !== undefined &&
-        (row.state !== relay.stateOf(toRelayConversation(conversationId, conversation)) ||
-          row.cardCovered === 1 ||
-          isUnknownCard(row.cardId));
+        (row.state !== relay.stateOf(toRelayConversation(conversationId, conversation)) || row.cardCovered === 1);
       if (behind || stale) {
         this.enqueue({ type: "conversation", accountId, conversationId });
         queued += 1;
@@ -375,27 +570,35 @@ export class Hub extends DurableObject<Env> {
   }
 
   private services(settings: Settings, budget: Budget): ProcessorContext {
-    const rest = new DiscordRest(settings.secrets.DISCORD_BOT_TOKEN, budget.fetch);
+    const rest = new DiscordRest(settings.secrets.DISCORD_BOT_TOKEN, budget.fetch, this.store);
     const chatwoot = chatwootClient(
       settings.config.chatwoot.baseUrl,
       settings.secrets.CHATWOOT_RELAY_TOKEN,
       budget.fetch,
+      this.store,
     );
     const forum = new DiscordForum(rest, this.store);
     const relay = relayFor(settings, forum, this.store);
-    return { settings, store: this.store, relay, forum, chatwoot, budget, rest };
+    return {
+      settings,
+      store: this.store,
+      relay,
+      forum,
+      chatwoot,
+      budget,
+      rest,
+      enqueueMetadata: (accountId, inboxId, discordUserId) =>
+        this.enqueue({
+          type: "metadata",
+          accountId,
+          ...(inboxId ? { inboxId } : {}),
+          ...(discordUserId ? { discordUserId } : {}),
+        }),
+    };
   }
 
   private enqueue(payload: JobPayload, notBefore?: number): void {
     this.store.enqueue(jobKey(payload), PRIORITY[payload.type], JSON.stringify(payload), notBefore);
-  }
-
-  /** Sets the alarm for the earliest due job (or `at`), unless an earlier alarm is already set. */
-  private async schedule(at?: number): Promise<void> {
-    const next = at ?? this.store.nextWakeup();
-    if (next === undefined) return;
-    const current = await this.ctx.storage.getAlarm();
-    if (current === null || current > next) await this.ctx.storage.setAlarm(next);
   }
 }
 
@@ -416,25 +619,25 @@ async function respond(
   const body = v2
     ? { flags: MessageFlags.IsComponentsV2, components }
     : { content, ...(components ? { components } : {}) };
-  try {
-    await rest.patch<RESTPatchAPIWebhookWithTokenMessageResult, RESTPatchAPIWebhookWithTokenMessageJSONBody>(
-      Routes.webhookMessage(job.applicationId, job.token, "@original"),
-      { body: { ...body, allowed_mentions: { parse: [] } }, auth: false },
-    );
-  } catch (error) {
-    log.error("command follow-up failed", { interactionId: job.interactionId, ...errorFields(error) });
-  }
+  await rest.patch<RESTPatchAPIWebhookWithTokenMessageResult, RESTPatchAPIWebhookWithTokenMessageJSONBody>(
+    Routes.webhookMessage(job.applicationId, job.token, "@original"),
+    { body: { ...body, allowed_mentions: { parse: [] } }, auth: false, interaction: true },
+  );
 }
 
 /** One job per key: a job queued again while it waits is not queued twice. */
 function jobKey(payload: JobPayload): string {
   switch (payload.type) {
     case "command":
-      return `command:${payload.job.interactionId}`;
+    case "feedback":
+      return `${payload.type}:${payload.job.interactionId}`;
+    case "metadata":
+      return `metadata:${payload.accountId}:${payload.inboxId ?? ""}:${payload.discordUserId ?? ""}`;
     case "sweep":
       return `sweep:${payload.accountId}`;
     case "queue":
       return "queue";
+    case "sync":
     case "conversation":
       return `${payload.type}:${payload.accountId}:${payload.conversationId}`;
     case "answer":
@@ -444,12 +647,16 @@ function jobKey(payload: JobPayload): string {
   }
 }
 
-function requiredBudget(payload: JobPayload, settings: Settings): number {
+function requiredBudget(payload: JobPayload): number {
   if (payload.type === "command") return COMMAND_BUDGET;
-  if (payload.type === "queue") return queueBudget(settings.config.accounts.length);
+  if (payload.type === "queue") return 3;
   return payload.type === "sweep" ? 1 : MIN_BUDGET;
 }
 
 function answerKey(answerId: string): string {
   return `answer:${answerId}`;
+}
+
+function sameLabels(actual: string[], expected: string[]): boolean {
+  return actual.length === expected.length && [...actual].sort().join("\0") === [...expected].sort().join("\0");
 }

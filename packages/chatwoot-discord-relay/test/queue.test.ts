@@ -75,7 +75,7 @@ function context(store = new MapStore(), escalation: object = { escalationRoleId
     settings,
     store,
     chatwoot: chatwootClient(settings.config.chatwoot.baseUrl, "relay-token", fetch),
-    rest: new DiscordRest("bot", fetch, async () => {}),
+    rest: new DiscordRest("bot", fetch),
   };
 }
 
@@ -211,10 +211,10 @@ describe("support queue", () => {
       [late, ...others(20)],
     ];
     const roles: string[][] = [];
-    for (const open of runs) {
+    for (const [index, open] of runs.entries()) {
       vi.restoreAllMocks();
       const { requests } = world(open);
-      await postQueue(context(store), NOW * 1000);
+      await postQueue(context(store), NOW * 1000 + index * 1000);
       roles.push(posted(requests)[0].allowed_mentions.roles);
     }
 
@@ -244,6 +244,6 @@ describe("support queue", () => {
     expect(messages.filter((message) => message.allowed_mentions.roles.length > 0)).toHaveLength(1);
     // A retry sends the same nonces, so Discord creates no message twice.
     expect(messages.every((message) => message.enforce_nonce === true)).toBe(true);
-    expect(messages[0].nonce).toBe(messages[2].nonce);
+    expect(messages[1].nonce).toBe(messages[2].nonce);
   });
 });

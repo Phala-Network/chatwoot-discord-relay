@@ -1,6 +1,7 @@
 // Messages, errors, and checks shared by the interaction handler (Worker) and the deferred
 // command runner (Durable Object).
 
+export const UNKNOWN_RESULT = "❌ The result is unknown. Check in Chatwoot before trying again.";
 export const FAILED = "❌ That did not work. Please do it in Chatwoot.";
 export const NOT_LINKED = "Your Discord account is not linked to a Chatwoot agent.";
 

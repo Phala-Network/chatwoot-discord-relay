@@ -5,6 +5,7 @@ export interface Recorded {
   url: URL;
   headers: Headers;
   redirect: Request["redirect"];
+  signal: AbortSignal;
   body: string;
   form: FormData | undefined;
 }
@@ -30,6 +31,7 @@ export function mockFetch(...routes: Route[]) {
     const type = request.headers.get("content-type") ?? "";
     const form = type.startsWith("multipart/form-data") ? await request.clone().formData() : undefined;
     const recorded: Recorded = {
+      signal: request.signal,
       method: request.method,
       url: new URL(request.url),
       headers: request.headers,

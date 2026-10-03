@@ -1,19 +1,10 @@
-// Minimal Discord REST client over fetch (Workers-native). Each call names its discord-api-types
-// request and result types. Follows Discord's documented rate limits
-// (https://discord.com/developers/docs/topics/rate-limits): per-route limits are tracked by
-// their X-RateLimit-Bucket (plus the route's top-level resource), a bucket whose
-// X-RateLimit-Remaining reached 0 is waited out, and a 429 is retried after `retry_after`,
-// pausing every route when it is the global limit. Waits are capped so an invocation never
-// sleeps for long; a longer limit fails the job, which then waits as long as Discord asks.
-
 import type { Fetch } from "../../../../shared/chatwoot/api.ts";
 import { isRecord, parseJson } from "../../../../shared/json.ts";
+import type { RateLimitStore } from "../../../../shared/rate-limit.ts";
 import manifest from "../../package.json" with { type: "json" };
 
 const API_BASE = "https://discord.com/api/v10";
 const USER_AGENT = `DiscordBot (https://github.com/Phala-Network/chatwoot-workers, ${manifest.version})`;
-const MAX_WAIT_MS = 10_000;
-const MAX_ATTEMPTS = 3;
 
 /**
  * A non-2xx answer from Discord. `code` is Discord's JSON error code when present; a rate limit
@@ -54,29 +45,25 @@ interface DiscordRequest<Body = never, Query extends object = never> {
   query?: Query;
   /** Webhook and interaction-token routes authenticate by URL; send no bot token. */
   auth?: boolean;
-  /** false: a rate limit fails the request at once, for one someone is waiting on. */
-  retry?: boolean;
+  interaction?: boolean;
+  signal?: AbortSignal;
 }
 
 export class DiscordRest {
-  /** Route -> the rate limit bucket Discord reported for it. */
-  private readonly buckets = new Map<string, string>();
-  /** Bucket key -> when it has requests again (ms since the epoch). */
-  private readonly resets = new Map<string, number>();
-  private globalReset = 0;
   private readonly token: string;
   private readonly fetch: Fetch;
-  private readonly sleep: (ms: number) => Promise<void>;
+  private readonly limits: RateLimitStore;
 
-  // Plain fields, not parameter properties: scripts/ runs this file with Node's type stripping.
-  constructor(
-    token: string,
-    fetch: Fetch,
-    sleep: (ms: number) => Promise<void> = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
-  ) {
+  constructor(token: string, fetch: Fetch, limits?: RateLimitStore) {
     this.token = token;
     this.fetch = fetch;
-    this.sleep = sleep;
+    const memory = new Map<string, string>();
+    this.limits = limits ?? {
+      get: (key) => memory.get(key),
+      set: (key, value) => {
+        memory.set(key, value);
+      },
+    };
   }
 
   get<Result, Query extends object = never>(path: string, request?: DiscordRequest<never, Query>): Promise<Result> {
@@ -110,7 +97,20 @@ export class DiscordRest {
     path: string,
     request: DiscordRequest<Body, Query> = {},
   ): Promise<Result> {
-    const route = `${method} ${path.replace(/\/messages\/[^/]+/, "/messages/:id")}`;
+    const scope = request.interaction ? "interaction" : request.auth === false ? "unauthenticated" : "bot";
+    const majorPath = /^\/(?:channels|guilds)\/[^/]+|^\/webhooks\/[^/]+(?:\/[^/]+)?/.exec(path)?.[0] ?? "";
+    const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(majorPath));
+    const major = Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
+    const route = `${scope}:${method}:${path.replace(majorPath, majorPath ? "/:major" : "").replace(/\/messages\/[^/]+/, "/messages/:id")}`;
+    const routeKey = `discord:route:${route}`;
+    const bucketKey = () => `discord:bucket:${scope}:${this.limits.get(routeKey) ?? route}:${major}`;
+    const globalKey = `discord:global:${scope}`;
+    const wait =
+      Math.max(
+        request.interaction ? 0 : Number(this.limits.get(globalKey) ?? 0),
+        Number(this.limits.get(bucketKey()) ?? 0),
+      ) - Date.now();
+    if (wait > 0) throw new DiscordHttpError(429, undefined, "rate limited", wait);
     const query = new URLSearchParams();
     for (const [key, value] of Object.entries(request.query ?? {})) {
       if (value !== undefined) query.set(key, String(value));
@@ -120,55 +120,42 @@ export class DiscordRest {
     if (request.auth !== false) headers.set("authorization", `Bot ${this.token}`);
     if (request.body !== undefined) headers.set("content-type", "application/json");
 
-    for (let attempt = 1; ; attempt += 1) {
-      const wait = Math.max(this.globalReset, this.resets.get(this.bucketKey(route, path)) ?? 0) - Date.now();
-      if (wait > MAX_WAIT_MS || (wait > 0 && request.retry === false)) {
-        throw new DiscordHttpError(429, undefined, "rate limited", wait);
-      }
-      if (wait > 0) await this.sleep(wait);
-
-      const response = await this.fetch(
-        new Request(url, {
-          method,
-          headers,
-          // Never followed: a redirect could carry the bot token elsewhere, and each hop would be
-          // a subrequest the budget does not count.
-          redirect: "manual",
-          ...(request.body === undefined ? {} : { body: JSON.stringify(request.body) }),
-        }),
-      );
-      const text = await response.text();
-      const bucket = response.headers.get("x-ratelimit-bucket");
-      if (bucket) this.buckets.set(route, bucket);
-      const key = this.bucketKey(route, path);
-      if (response.headers.get("x-ratelimit-remaining") === "0") {
-        this.resets.set(key, Date.now() + seconds(response.headers.get("x-ratelimit-reset-after")) * 1000);
-      }
-
-      if (response.ok) return result(text);
-
-      const data = parseJson(text);
-      if (response.status === 429) {
-        const retryAt = Date.now() + seconds(field(data, "retry_after") ?? response.headers.get("retry-after")) * 1000;
-        if (field(data, "global") === true || response.headers.get("x-ratelimit-global") === "true") {
-          this.globalReset = retryAt;
-        } else {
-          this.resets.set(key, retryAt);
-        }
-        const wait = Math.max(0, retryAt - Date.now());
-        if (request.retry !== false && attempt < MAX_ATTEMPTS && wait <= MAX_WAIT_MS) continue;
-        throw new DiscordHttpError(429, errorCode(data), errorMessage(data, response.statusText), wait);
-      }
-      throw new DiscordHttpError(response.status, errorCode(data), errorMessage(data, response.statusText));
+    const response = await this.fetch(
+      new Request(url, {
+        method,
+        headers,
+        redirect: "manual",
+        ...(request.signal ? { signal: request.signal } : {}),
+        ...(request.body === undefined ? {} : { body: JSON.stringify(request.body) }),
+      }),
+    );
+    const text = await response.text();
+    const bucket = response.headers.get("x-ratelimit-bucket");
+    if (bucket) this.limits.set(routeKey, bucket);
+    const key = bucketKey();
+    if (response.headers.get("x-ratelimit-remaining") === "0") {
+      this.reset(key, Date.now() + seconds(response.headers.get("x-ratelimit-reset-after")) * 1000);
     }
+
+    if (response.ok) return result(text);
+
+    const data = parseJson(text);
+    if (response.status === 429) {
+      const retryAt = Date.now() + seconds(field(data, "retry_after") ?? response.headers.get("retry-after")) * 1000;
+      if (field(data, "global") === true || response.headers.get("x-ratelimit-global") === "true") {
+        this.reset(request.interaction ? key : globalKey, retryAt);
+      } else {
+        this.reset(key, retryAt);
+      }
+      const wait = Math.max(0, retryAt - Date.now());
+      throw new DiscordHttpError(429, errorCode(data), errorMessage(data, response.statusText), wait);
+    }
+    throw new DiscordHttpError(response.status, errorCode(data), errorMessage(data, response.statusText));
   }
 
-  /** A bucket is shared per top-level resource (channel, guild, or webhook) in the path. */
-  private bucketKey(route: string, path: string): string {
-    const bucket = this.buckets.get(route);
-    if (!bucket) return route;
-    const major = /^\/(?:channels|guilds)\/\d+|^\/webhooks\/\d+\/[^/]+/.exec(path)?.[0] ?? "";
-    return `${bucket}:${major}`;
+  private reset(key: string, at: number): void {
+    const until = Math.max(Number(this.limits.get(key) ?? 0), at);
+    this.limits.set(key, String(until), Math.max(1, until - Date.now()));
   }
 }
 

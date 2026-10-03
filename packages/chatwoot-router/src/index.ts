@@ -3,8 +3,9 @@ import { bodyLimit } from "hono/body-limit";
 import { isFreshTimestamp, verifyChatwootSignature } from "../../../shared/chatwoot/signature.ts";
 import { ConfigError } from "../../../shared/config.ts";
 import { errorFields, log } from "../../../shared/log.ts";
+import { COORDINATOR_NAME } from "./coordinator.ts";
 import type { Env } from "./env.ts";
-import { ROUTER_NAME } from "./router.ts";
+import { conversationName } from "./router.ts";
 import { routesAccount } from "./routing.ts";
 import { loadSettings } from "./settings.ts";
 import { eventTarget } from "./webhook.ts";
@@ -48,7 +49,7 @@ app.post("/chatwoot/agent-bot", bodyLimit({ maxSize: 2 * 1024 * 1024 }), async (
   if (target.accountId !== signedBy || !routesAccount(settings, target.accountId)) {
     return context.text("account does not match the webhook secret", 403);
   }
-  await context.env.ROUTER.getByName(ROUTER_NAME).enqueueConversation(
+  await context.env.ROUTER.getByName(conversationName(target.accountId, target.conversationId)).enqueueConversation(
     target.accountId,
     target.conversationId,
     target.transition,
@@ -65,8 +66,9 @@ app.onError((error, context) => {
 export default {
   fetch: app.fetch,
   async scheduled(_controller, env, context) {
-    context.waitUntil(env.ROUTER.getByName(ROUTER_NAME).requestSweep());
+    context.waitUntil(env.COORDINATOR.getByName(COORDINATOR_NAME).requestSweep());
   },
 } satisfies ExportedHandler<Env>;
 
+export { Coordinator } from "./coordinator.ts";
 export { Router } from "./router.ts";

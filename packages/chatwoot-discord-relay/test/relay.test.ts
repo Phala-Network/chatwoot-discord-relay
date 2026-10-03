@@ -604,12 +604,14 @@ describe("Relay", () => {
   });
 
   it("posts a notice into the existing post, and archives a resolved post again afterwards", async () => {
-    expect(await relay.notify(3, message().conversation, "⚠️ Notice")).toBeUndefined(); // no post yet
+    expect(await relay.notify(3, message().conversation, "⚠️ Notice", "notice-1")).toBeUndefined(); // no post yet
     await relay.relay(message({ conversation: resolved }));
     await relay.sync(3, message({ conversation: resolved }).conversation, "thread-1");
     expect(forum.archived.has("thread-1")).toBe(true);
 
-    expect(await relay.notify(3, message({ conversation: resolved }).conversation, "⚠️ Notice")).toBeTypeOf("string");
+    expect(await relay.notify(3, message({ conversation: resolved }).conversation, "⚠️ Notice", "notice-2")).toBeTypeOf(
+      "string",
+    );
     expect(forum.calls.at(-1)).toEqual([
       "thread-1",
       { content: "⚠️ Notice", username: "Chatwoot", avatar_url: AVATARS.chatwoot, allowed_mentions: { parse: [] } },
@@ -623,7 +625,7 @@ describe("Relay", () => {
     await relay.relay(message());
     const contact = { name: "Jane Doe", avatarUrl: "https://cdn.example.com/jane.png" };
     const conversation = message({ conversation: { contact } }).conversation;
-    expect(await relay.postResponse(3, conversation, "Pick one\n\n**Response:** A")).toBeTypeOf("string");
+    expect(await relay.postResponse(3, conversation, "Pick one\n\n**Response:** A", "response-1")).toBeTypeOf("string");
     expect(forum.calls.at(-1)).toEqual([
       "thread-1",
       {
@@ -635,7 +637,7 @@ describe("Relay", () => {
     ]);
 
     const long = `Question\n\n**Responses:**\n${"• Notes: text\n".repeat(300)}`;
-    await relay.postResponse(3, conversation, long);
+    await relay.postResponse(3, conversation, long, "response-2");
     const content = forum.contents().at(-1) ?? "";
     expect(content.length).toBeLessThanOrEqual(CONTENT_LIMIT);
     expect(content.startsWith("Question\n\n**Responses:**\n• Notes: text\n")).toBe(true);
@@ -646,14 +648,21 @@ describe("Relay", () => {
 
   it("defuses mentions and subtext in a customer's response", async () => {
     await relay.relay(message());
-    await relay.postResponse(3, message().conversation, "Pick one\n\n**Response:** <@100000000000000777>\n-# x");
+    await relay.postResponse(
+      3,
+      message().conversation,
+      "Pick one\n\n**Response:** <@100000000000000777>\n-# x",
+      "response-3",
+    );
     expect(forum.contents().at(-1)).toBe("Pick one\n\n**Response:** <\u200b@100000000000000777>\n\u200b-# x");
   });
 
   it("forgets a post deleted in Discord instead of posting a response", async () => {
     await relay.relay(message());
     forum.failThreadWith = "gone";
-    expect(await relay.postResponse(3, message().conversation, "**Email:** a@example.com")).toBeUndefined();
+    expect(
+      await relay.postResponse(3, message().conversation, "**Email:** a@example.com", "response-4"),
+    ).toBeUndefined();
     await relay.relay(message({ id: 102, content: "New request" }));
     expect(forum.calls.map(([thread]) => thread)).toEqual([undefined, "thread-1", undefined, "thread-3"]);
     expect(forum.contents().at(-1)).toBe("New request");
@@ -858,15 +867,14 @@ describe("the card", () => {
     expect(forum.archived.has("thread-1")).toBe(false);
   });
 
-  it("posts one card after an answer to posting it was lost, deleting the one Discord kept", async () => {
+  it("does not replay a card when its creation response was lost", async () => {
     const { relay, forum } = relayWith({ card: ticketCard });
     const conversation = message().conversation;
     await relay.relay(message());
     forum.loseAnswer = true;
-    await expect(relay.sync(3, conversation, "thread-1")).rejects.toThrow();
     await relay.sync(3, conversation, "thread-1");
-    const { cards } = await forum.cardsAfter(FORUM, "thread-1", "0");
-    expect(cards).toEqual([forum.ids.at(-1)]);
+    await relay.sync(3, conversation, "thread-1");
+    expect(forum.calls.filter(([, payload]) => payload.flags === 1 << 15)).toHaveLength(1);
   });
 
   it("archives a resolved post again when that failed after its card moved", async () => {
@@ -919,31 +927,9 @@ describe("the card", () => {
     relay.answered(3, 12, answer, second);
     await relay.sync(3, conversation, "thread-1");
     expect(draftOffered()).toBe(`ticket:draft:${answer}`);
-    await relay.postResponse(3, conversation, "• Rating: 5");
+    await relay.postResponse(3, conversation, "• Rating: 5", "response-5");
     await relay.sync(3, conversation, "thread-1");
     expect(draftOffered()).toBe("ticket:reply");
-  });
-
-  it("looks for cards of unknown id page by page, from where it stopped", async () => {
-    const forum = new FakeForum();
-    const { relay, store } = relayWith({ card: ticketCard, forum });
-    const conversation = message().conversation;
-    await relay.relay(message());
-    await relay.sync(3, conversation, "thread-1");
-    const orphan = forum.ids.at(-1) ?? "";
-    // The post was adopted: its cards are not known.
-    store.updateConversation(3, 12, { cardId: `?${"1"}` });
-    const pages: string[] = [];
-    const cardsAfter = forum.cardsAfter.bind(forum);
-    forum.cardsAfter = async (forumId, thread, after) => {
-      pages.push(after);
-      // Two pages: the first ends at the orphan card.
-      return after === "1" ? { cards: [], next: String(BigInt(orphan) - 1n) } : cardsAfter(forumId, thread, after);
-    };
-    await relay.sync(3, conversation, "thread-1");
-    expect(pages).toEqual(["1", String(BigInt(orphan) - 1n)]);
-    expect(forum.deleted).toEqual([orphan]);
-    expect((await cardsAfter(FORUM, "thread-1", "0")).cards).toHaveLength(1);
   });
 
   it("keeps drafts to a customer message's parts right when a part fails", async () => {
@@ -963,7 +949,7 @@ describe("the card", () => {
     expect(draftOffered()).toBe("ticket:reply");
 
     // A response comes, then C2's last part: an answer to that part answers C2, before the response.
-    await relay.postResponse(3, conversation, "• Rating: 5");
+    await relay.postResponse(3, conversation, "• Rating: 5", "response-5");
     await relay.relay(message({ id: 2, content: long }));
     const lastPart = forum.ids.at(-1) ?? "";
     relay.answered(3, 12, snowflake(), lastPart);

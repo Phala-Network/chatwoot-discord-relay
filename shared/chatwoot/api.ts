@@ -6,6 +6,7 @@
 import createClient from "openapi-fetch";
 import { z } from "zod";
 import { log } from "../log.ts";
+import type { RateLimitStore } from "../rate-limit.ts";
 import type { MessageType, RelayAttachment, RelayConversation, RelayItem, RelayMessage } from "../types.ts";
 import type { components, operations, paths } from "./schema.ts";
 
@@ -15,12 +16,14 @@ export type Fetch = (input: Request) => Promise<Response>;
 export class ChatwootError extends Error {
   readonly status: number;
   readonly conversationMissing: boolean;
+  readonly retryAfterMs: number | undefined;
 
-  constructor(status: number, operation: string, conversationMissing = false) {
+  constructor(status: number, operation: string, conversationMissing = false, retryAfterMs?: number) {
     super(`Chatwoot ${operation} failed with HTTP ${status}`);
     this.name = "ChatwootError";
     this.status = status;
     this.conversationMissing = conversationMissing;
+    this.retryAfterMs = retryAfterMs;
   }
 }
 
@@ -172,13 +175,30 @@ type MessageQuery = NonNullable<operations["list-all-messages"]["parameters"]["q
   filter_internal_messages?: true;
 };
 
-export function chatwootClient(baseUrl: string, token: string, fetch: Fetch) {
+export function chatwootClient(baseUrl: string, token: string, fetch: Fetch, limits?: RateLimitStore) {
   const client = createClient<paths>({
     baseUrl: baseUrl.replace(/\/+$/, ""),
     headers: { api_access_token: token },
     // A redirect is an error, never followed: it could carry the token to another host, and each
     // hop would be a subrequest the budget does not count. Configure Chatwoot's final URL.
-    fetch: (request) => fetch(new Request(request, { redirect: "manual" })),
+    fetch: async (request) => {
+      const account = /\/accounts\/(\d+)\//.exec(new URL(request.url).pathname)?.[1] ?? "profile";
+      const key = `chatwoot:limit:${baseUrl}:${account}`;
+      const wait = Number(limits?.get(key) ?? 0) - Date.now();
+      if (wait > 0) throw new ChatwootError(429, "rate limited", false, wait);
+      const response = await fetch(new Request(request, { redirect: "manual" }));
+      if (response.status === 429) {
+        const header = response.headers.get("retry-after");
+        const seconds = Number(header);
+        const delay =
+          header === null ? 5000 : Number.isFinite(seconds) ? seconds * 1000 : Date.parse(header) - Date.now();
+        const retryAfterMs = Number.isFinite(delay) ? Math.max(1, delay) : 5000;
+        limits?.set(key, String(Date.now() + retryAfterMs), retryAfterMs);
+        await response.body?.cancel();
+        throw new ChatwootError(429, "rate limited", false, retryAfterMs);
+      }
+      return response;
+    },
   });
 
   async function data<T>(operation: string, pending: Promise<{ data?: T; response: Response }>): Promise<T> {

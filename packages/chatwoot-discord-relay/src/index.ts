@@ -6,20 +6,16 @@ import { verifyKey } from "discord-interactions";
 import { Hono } from "hono";
 import { bodyLimit } from "hono/body-limit";
 import { z } from "zod";
+import { within } from "../../../shared/deadline.ts";
 import { errorFields, log } from "../../../shared/log.ts";
 import { eventTarget, isFreshTimestamp, verifyChatwootSignature } from "./chatwoot/webhook.ts";
-import { FAILED } from "./commands/common.ts";
 import { CONTENT_MAX } from "./commands/definitions.ts";
-import { readDraft } from "./commands/draft.ts";
-import { handleInteraction, privately } from "./commands/handler.ts";
 import { ConfigError } from "./config.ts";
-import { DiscordRest } from "./discord/rest.ts";
 import type { Env } from "./env.ts";
 import { HUB_NAME } from "./hub.ts";
 import { loadSettings } from "./settings.ts";
 
-/** Reply with draft may look up the triage bot's answer this long, while Discord waits for the reply editor. */
-const DRAFT_DEADLINE_MS = 2000;
+const INTERACTION_DEADLINE_MS = 2500;
 
 const app = new Hono<{ Bindings: Env }>();
 
@@ -107,49 +103,38 @@ app.post("/triage/answered", bodyLimit({ maxSize: 64 * 1024 }), async (c) => {
   return c.json({ ok: true });
 });
 
-app.post("/discord/interactions", bodyLimit({ maxSize: 1024 * 1024 }), async (c) => {
-  // Discord waits 3 s for the reply editor, counted from the interaction: one deadline for all of it.
-  const deadline = AbortSignal.timeout(DRAFT_DEADLINE_MS);
-  const settings = await loadSettings(c.env);
-  const signature = c.req.header("x-signature-ed25519");
-  const timestamp = c.req.header("x-signature-timestamp");
-  const body = await c.req.arrayBuffer();
-  if (!signature || !timestamp || !(await verifyKey(body, signature, timestamp, settings.secrets.DISCORD_PUBLIC_KEY))) {
-    return c.text("invalid request signature", 401);
-  }
-  // A signature does not expire: an old signed request is refused like a stale webhook.
-  if (!isFreshTimestamp(timestamp, Math.floor(Date.now() / 1000))) return c.text("stale request", 401);
-
-  let interaction: APIInteraction;
+app.post("/discord/interactions", async (c) => {
+  const deadline = AbortSignal.timeout(INTERACTION_DEADLINE_MS);
   try {
-    // Discord signed this body, so it is a well-formed interaction (typed, not validated).
-    interaction = JSON.parse(new TextDecoder().decode(body));
-  } catch {
-    return c.text("bad request", 400);
-  }
-
-  const stub = hub(c.env);
-  try {
-    const result = await handleInteraction(interaction, {
-      settings,
-      ticketForThread: async (threadId) => (await stub.ticketForThread(threadId)) ?? undefined,
-      draftOf: async (threadId, answerId) => {
-        const kept = await stub.answerDraft(answerId);
-        if (kept !== null) return { text: kept };
-        const rest = new DiscordRest(settings.secrets.DISCORD_BOT_TOKEN, (request) =>
-          fetch(request, { signal: deadline }),
-        );
-        // Not read in time (or rate limited): the answer is linked instead.
-        return readDraft(rest, threadId, answerId, settings.config.triage.userId).catch(() => ({
-          missing: "unreadable" as const,
-        }));
-      },
-    });
-    if (result.job) await stub.enqueueCommand(result.job);
-    return c.json(result.response);
+    const response = await within(
+      (async () => {
+        const settings = await loadSettings(c.env);
+        const signature = c.req.header("x-signature-ed25519");
+        const timestamp = c.req.header("x-signature-timestamp");
+        const body = await interactionBody(c.req.raw, deadline);
+        if (!body) return c.text("payload too large", 413);
+        if (
+          !signature ||
+          !timestamp ||
+          !(await verifyKey(body, signature, timestamp, settings.secrets.DISCORD_PUBLIC_KEY))
+        )
+          return c.text("invalid request signature", 401);
+        if (!isFreshTimestamp(timestamp, Math.floor(Date.now() / 1000))) return c.text("stale request", 401);
+        let interaction: APIInteraction;
+        try {
+          interaction = JSON.parse(new TextDecoder().decode(body));
+        } catch {
+          return c.text("bad request", 400);
+        }
+        deadline.throwIfAborted();
+        return c.json(await hub(c.env).interaction(interaction));
+      })(),
+      deadline,
+    );
+    return response;
   } catch (error) {
-    log.error("interaction failed", { interactionId: interaction.id, ...errorFields(error) });
-    return c.json(privately(FAILED).response);
+    log.error("interaction initial response failed", errorFields(error));
+    return c.text("The request could not be confirmed in time. Check in Chatwoot before trying again.", 503);
   }
 });
 
@@ -172,3 +157,27 @@ const handler = {
 export default handler;
 
 export { Hub } from "./hub.ts";
+
+async function interactionBody(request: Request, signal: AbortSignal): Promise<ArrayBuffer | undefined> {
+  if (!request.body) return new ArrayBuffer(0);
+  const reader = request.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  try {
+    for (;;) {
+      const { done, value } = await within(reader.read(), signal);
+      if (done) return await new Blob(chunks).arrayBuffer();
+      size += value.byteLength;
+      if (size > 1024 * 1024) {
+        await reader.cancel();
+        return;
+      }
+      chunks.push(value);
+    }
+  } catch (error) {
+    await reader.cancel().catch(() => {});
+    throw error;
+  } finally {
+    reader.releaseLock();
+  }
+}

@@ -91,12 +91,14 @@ export async function readTurn(
   conversationId: number,
 ) {
   const messages: ChatwootMessage[] = [];
+  const pages: ChatwootMessage[][] = [];
   let before: number | undefined;
   let boundary: ChatwootMessage | undefined;
   let complete = false;
   let deleted = false;
   for (let page = 0; page < 5; page += 1) {
     const batch = await chatwoot.listMessages(accountId, conversationId, before === undefined ? {} : { before });
+    pages.push(batch);
     for (const message of batch.toReversed()) {
       if (message.message_type === 2 && message.content_attributes?.deleted) {
         deleted = true;
@@ -141,5 +143,5 @@ export async function readTurn(
   }
   if (deleted || missing || !complete) guard.handoff = true;
   saveGuard(store, accountId, conversationId, guard);
-  return { messages: messages.toReversed(), boundary: boundary?.id ?? 0, handoff: guard.handoff };
+  return { pages, messages: messages.toReversed(), boundary: boundary?.id ?? 0, handoff: guard.handoff };
 }

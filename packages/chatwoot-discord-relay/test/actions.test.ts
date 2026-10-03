@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { Budget } from "../../../shared/budget.ts";
-import { executeCommand } from "../src/commands/actions.ts";
+import { type CommandExecution, executeCommand } from "../src/commands/actions.ts";
 import type { CommandAction, CommandJob } from "../src/commands/job.ts";
 import { ALICE, BOB, json, mockFetch, on, type Route, testSettings } from "./helpers.ts";
 
@@ -30,8 +30,24 @@ function run(action: CommandAction, ...routes: Route[]) {
 }
 
 function runWith(given: typeof settings, action: CommandAction, ...routes: Route[]) {
+  return runWithPreparation(given, action, undefined, undefined, ...routes);
+}
+
+function runWithPreparation(
+  given: typeof settings,
+  action: CommandAction,
+  retryable: CommandExecution["retryable"],
+  confirmUnknown: CommandExecution["confirmUnknown"],
+  ...routes: Route[]
+) {
   const mock = mockFetch(profile, ...routes);
-  const outcome = executeCommand(job(action), given, (request) => fetch(request));
+  const execution: CommandExecution = {
+    settings: given,
+    fetch: (request) => fetch(request),
+  };
+  if (retryable) execution.retryable = retryable;
+  if (confirmUnknown) execution.confirmUnknown = confirmUnknown;
+  const outcome = executeCommand(job(action), execution);
   return { outcome, result: outcome.then(({ content }) => content), requests: mock.requests };
 }
 
@@ -46,6 +62,26 @@ describe("executeCommand", () => {
     expect(await result).toBe("✅ Resolved.");
     expect(requests.every((request) => request.headers.get("api_access_token") === "token-alice")).toBe(true);
     expect(JSON.parse(requests.at(-1)?.body ?? "")).toEqual({ status: "resolved" });
+  });
+
+  it("confirms a Chatwoot mutation accepted before a 500 response", async () => {
+    let status = "open";
+    const { result } = runWithPreparation(
+      settings,
+      { type: "status", status: "resolved" },
+      () => false,
+      async (chatwoot) => {
+        const conversation = await chatwoot.getConversation(3, 15);
+        return conversation?.status === "resolved" ? "Resolved." : undefined;
+      },
+      on("POST", `${conversation}/toggle_status`, () => {
+        status = "resolved";
+        return json({ error: "proxy lost the response" }, { status: 502 });
+      }),
+      on("GET", conversation, () => json({ id: 15, status })),
+    );
+    const outcome = await result;
+    expect(outcome).toBe("✅ Resolved.");
   });
 
   it("reopens", async () => {
@@ -284,7 +320,9 @@ describe("executeCommand", () => {
     mockFetch(
       on("GET", `${cw}/profile`, () => json({ id: 42, name: "A", email: "a@example.com", accounts: [{ id: 99 }] })),
     );
-    expect((await executeCommand(job({ type: "block" }), settings, (request) => fetch(request))).content).toBe(
+    expect(
+      (await executeCommand(job({ type: "block" }), { settings, fetch: (request) => fetch(request) })).content,
+    ).toBe(
       "❌ Your Chatwoot user is no longer an agent in this Chatwoot account. Ask an admin to add you back, or to unlink your Discord account.",
     );
   });
@@ -296,11 +334,10 @@ describe("executeCommand", () => {
       ),
       ok("POST", `${conversation}/messages`),
     );
-    const { content } = await executeCommand(
-      job({ type: "message", private: true, content: "hi", files: [] }),
+    const { content } = await executeCommand(job({ type: "message", private: true, content: "hi", files: [] }), {
       settings,
-      (request) => fetch(request),
-    );
+      fetch: (request) => fetch(request),
+    });
     expect(content).toBe(
       "❌ Your Chatwoot access token belongs to another Chatwoot user, so nothing was done. Ask an admin to fix your link.",
     );
@@ -315,7 +352,7 @@ describe("executeCommand", () => {
         () => new Response(null, { status: 301, headers: { location: "https://evil.example/" } }),
       ),
     );
-    const { content } = await executeCommand(job({ type: "block" }), settings, (request) => fetch(request));
+    const { content } = await executeCommand(job({ type: "block" }), { settings, fetch: (request) => fetch(request) });
     expect(content).toBe("❌ That did not work. Please do it in Chatwoot.");
     expect(requests.map((request) => [request.url.hostname, request.redirect])).toEqual([
       ["chatwoot.example.com", "manual"],
@@ -325,7 +362,10 @@ describe("executeCommand", () => {
   it("refuses a queued command once its invoker is no longer linked", async () => {
     const unlinked = testSettings({ agents: [{ discordUserId: BOB, chatwootUserId: 43 }] });
     const { requests } = mockFetch(profile);
-    const { content } = await executeCommand(job({ type: "block" }), unlinked, (request) => fetch(request));
+    const { content } = await executeCommand(job({ type: "block" }), {
+      settings: unlinked,
+      fetch: (request) => fetch(request),
+    });
     expect(content).toBe("❌ Your Discord account is not linked to a Chatwoot agent.");
     expect(requests).toEqual([]);
   });
@@ -499,8 +539,7 @@ describe("executeCommand", () => {
       const mock = mockFetch(profile, agents, ok("POST", `${conversation}/assignments`), state, labels);
       const { content, components } = await executeCommand(
         { ...job({ type: "assign", chatwootUserId: 43 }), panel: true },
-        settings,
-        (request) => fetch(request),
+        { settings, fetch: (request) => fetch(request) },
       );
       expect(content).toBe("✅ Assigned to Bob Example.");
       expect(card(components).parts[0]).toBe("### Acme #15 · Jane <\u200b@123>\n✅ Assigned to Bob Example.");
@@ -574,11 +613,10 @@ describe("executeCommand", () => {
         : new Promise<Response>((_resolve, reject) => {
             request.signal.addEventListener("abort", () => reject(request.signal.reason));
           });
-    const { content } = await executeCommand(
-      job({ type: "status", status: "resolved" }),
+    const { content } = await executeCommand(job({ type: "status", status: "resolved" }), {
       settings,
-      new Budget(20, hanging, 20).fetch,
-    );
+      fetch: new Budget(20, hanging).fetchWith(20),
+    });
     expect(content).toMatch(/^❌ Chatwoot or Discord did not answer in time\. Check in Chatwoot whether it was done/);
   });
 });

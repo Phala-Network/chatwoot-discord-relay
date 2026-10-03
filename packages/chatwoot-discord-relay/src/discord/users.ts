@@ -16,6 +16,6 @@ export function avatarUrl(user: Pick<APIUser, "id" | "avatar" | "discriminator">
 }
 
 /** Looks up a user (GET /users/{user.id}) and returns their avatar URL. */
-export async function fetchAvatarUrl(rest: DiscordRest, userId: string): Promise<string> {
-  return avatarUrl(await rest.get<RESTGetAPIUserResult>(Routes.user(userId)));
+export async function fetchAvatarUrl(rest: DiscordRest, userId: string, signal?: AbortSignal): Promise<string> {
+  return avatarUrl(await rest.get<RESTGetAPIUserResult>(Routes.user(userId), signal ? { signal } : {}));
 }

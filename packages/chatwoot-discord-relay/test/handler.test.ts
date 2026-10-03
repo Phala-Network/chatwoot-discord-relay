@@ -456,7 +456,7 @@ describe("ticket buttons and the Manage panel", () => {
     draft = { missing: "unreadable" };
     expect(privateText(await press(`ticket:draft:${ANSWER}`))).toMatch(
       new RegExp(
-        `Message Content intent.*\\(https://discord\\.com/channels/[^/]+/${THREAD}/${ANSWER}\\).*Reply with this`,
+        `no longer stored here.*\\(https://discord\\.com/channels/[^/]+/${THREAD}/${ANSWER}\\).*Reply with this`,
       ),
     );
     draft = { text: "Hi, restart the CVM from the dashboard." };

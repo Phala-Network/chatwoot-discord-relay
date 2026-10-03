@@ -1,17 +1,24 @@
 import {
   createExecutionContext,
   createScheduledController,
+  listDurableObjectIds,
   runInDurableObject,
   waitOnExecutionContext,
 } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { COORDINATOR_NAME } from "../src/coordinator.ts";
 import worker from "../src/index.ts";
-import { ROUTER_NAME } from "../src/router.ts";
+import { conversationName } from "../src/router.ts";
 import { json, mockFetch, on } from "./helpers.ts";
 import { activity, CW, incoming as customer, JEV, sent, world } from "./world.ts";
 
-const stub = () => env.ROUTER.getByName(ROUTER_NAME);
+const coordinator = () => env.COORDINATOR.getByName(COORDINATOR_NAME);
+const stub = (accountId = 1, conversationId = 5) => env.ROUTER.getByName(conversationName(accountId, conversationId));
+const objects = async () => [
+  coordinator(),
+  ...(await listDurableObjectIds(env.ROUTER)).map((id) => env.ROUTER.get(id)),
+];
 const base = "chatwoot.example.com/api/v1/accounts/1/conversations";
 const incoming = (conversationId: number, accountId = 1) => ({
   event: "message_created",
@@ -46,14 +53,18 @@ async function webhook(payload: unknown, secret = "secret-acme", age = 0): Promi
 async function drain(timeout = 5000): Promise<void> {
   await vi.waitFor(
     async () => {
-      const due = await runInDurableObject(
-        stub(),
-        (_instance, state) =>
-          state.storage.sql
-            .exec<{ count: number }>("SELECT COUNT(*) AS count FROM jobs WHERE not_before <= ?", Date.now())
-            .one().count,
+      const counts = await Promise.all(
+        (await objects()).map((object) =>
+          runInDurableObject(
+            object,
+            (_instance, state) =>
+              state.storage.sql
+                .exec<{ count: number }>("SELECT COUNT(*) AS count FROM jobs WHERE not_before <= ?", Date.now())
+                .one().count,
+          ),
+        ),
       );
-      expect(due).toBe(0);
+      expect(counts.reduce((total, count) => total + count, 0)).toBe(0);
     },
     { timeout, interval: 20 },
   );
@@ -61,18 +72,26 @@ async function drain(timeout = 5000): Promise<void> {
 
 afterEach(async () => {
   await drain();
-  await runInDurableObject(stub(), async (_instance, state) => {
-    state.storage.sql.exec("DELETE FROM jobs; DELETE FROM cache");
-    await state.storage.deleteAlarm();
-  });
+  await Promise.all(
+    (await objects()).map((object) =>
+      runInDurableObject(object, async (_instance, state) => {
+        state.storage.sql.exec("DELETE FROM jobs; DELETE FROM cache");
+        await state.storage.deleteAlarm();
+      }),
+    ),
+  );
   vi.restoreAllMocks();
 });
 
 async function retryNow() {
-  await runInDurableObject(stub(), async (_instance, state) => {
-    state.storage.sql.exec("UPDATE jobs SET not_before = 0");
-    await state.storage.setAlarm(Date.now());
-  });
+  await Promise.all(
+    (await objects()).map((object) =>
+      runInDurableObject(object, async (_instance, state) => {
+        state.storage.sql.exec("UPDATE jobs SET not_before = 0");
+        await state.storage.setAlarm(Date.now());
+      }),
+    ),
+  );
   await drain();
 }
 
@@ -355,9 +374,9 @@ describe("account sweep", () => {
         return json({});
       }),
     );
-    await stub().requestSweep();
+    await coordinator().requestSweep();
     await drain();
-    await stub().requestSweep();
+    await coordinator().requestSweep();
     await drain();
     expect(conversations.map((row) => row.status)).toEqual(["open", "resolved", "snoozed", "open", "open", "open"]);
     expect(conversations.slice(0, 3).map((row) => row.meta.assignee)).toEqual([null, { id: 1 }, { id: 1 }]);
@@ -374,7 +393,7 @@ describe("account sweep", () => {
     await drain(15000);
     expect(mock.pending.size).toBe(25);
     expect(mock.pages).toEqual([1, 2]);
-    await stub().requestSweep();
+    await coordinator().requestSweep();
     await drain(15000);
     expect(mock.pending.size).toBe(0);
     expect(mock.pages).toEqual([1, 2, 1, 2]);
@@ -383,22 +402,22 @@ describe("account sweep", () => {
 
   it("retries the same failed page without delaying already queued routing", async () => {
     const mock = sweepWorld(true);
-    await stub().requestSweep();
+    await coordinator().requestSweep();
     await drain(15000);
     expect(mock.pending.size).toBe(25);
     await retryNow();
     expect(mock.pages).toEqual([1, 2, 2]);
-    await stub().requestSweep();
+    await coordinator().requestSweep();
     await drain(15000);
     expect(mock.pending.size).toBe(0);
   }, 30000);
 
   it("hands off disconnected bot leftovers across page shifts without Jev", async () => {
     const mock = sweepWorld(false, true);
-    await stub().requestSweep();
+    await coordinator().requestSweep();
     await drain(15000);
     expect(mock.pending.size).toBe(25);
-    await stub().requestSweep();
+    await coordinator().requestSweep();
     await drain(15000);
     expect(mock.pending.size).toBe(0);
     expect(sent(mock.requests, "POST", JEV)).toEqual([]);
@@ -413,4 +432,36 @@ describe("account sweep", () => {
       ),
     ).toBe(true);
   }, 20000);
+});
+
+it("measures routing behind a slow conversation", async () => {
+  let startedSlow = false;
+  let finished = 0;
+  let releaseSlow!: () => void;
+  const slow = new Promise<void>((resolve) => {
+    releaseSlow = resolve;
+  });
+  const base = "chatwoot.example.com/api/v1/accounts/1";
+  mockFetch(
+    on("GET", `${base}/conversations/801`, async () => {
+      startedSlow = true;
+      await slow;
+      return json({}, { status: 503 });
+    }),
+    on("GET", `${base}/conversations/802`, () => {
+      return json({ id: 802, status: "pending", inbox_id: 2 });
+    }),
+    on("GET", `${base}/inboxes/2/agent_bot`, () => json({ agent_bot: { id: 1, account_id: 1 } })),
+    on("GET", `${base}/conversations/802/messages`, () => json({ payload: [] })),
+    on("POST", `${base}/conversations/802/toggle_status`, () => {
+      finished = Date.now();
+      return json({});
+    }),
+  );
+  await stub(1, 801).enqueueConversation(1, 801);
+  await vi.waitFor(() => expect(startedSlow).toBe(true));
+  await stub(1, 802).enqueueConversation(1, 802);
+  await vi.waitFor(() => expect(finished).toBeGreaterThan(0));
+  releaseSlow();
+  await drain();
 });

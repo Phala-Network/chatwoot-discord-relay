@@ -2,6 +2,7 @@
 // token, so Chatwoot applies its normal permissions and records who did it.
 
 import type { APIMessageTopLevelComponent } from "discord-api-types/v10";
+import { BudgetExhaustedError, JobDeadlineError } from "../../../../shared/budget.ts";
 import {
   type ChatwootClient,
   ChatwootError,
@@ -10,34 +11,50 @@ import {
   personAssignee,
   type StatusChange,
 } from "../../../../shared/chatwoot/api.ts";
+import { parallel } from "../../../../shared/concurrent.ts";
 import { errorFields, log } from "../../../../shared/log.ts";
+import type { RateLimitStore } from "../../../../shared/rate-limit.ts";
 import type { Settings } from "../config.ts";
 import { clip, defused } from "../relay/format.ts";
 import { downloadAttachment } from "./attachments.ts";
-import { FAILED, filesTooLarge, NOT_LINKED, UserError } from "./common.ts";
+import { FAILED, filesTooLarge, NOT_LINKED, UNKNOWN_RESULT, UserError } from "./common.ts";
 import { assigneeMenu, panel } from "./components.ts";
 import { PRIORITY_NAMES } from "./definitions.ts";
-import type { CommandJob } from "./job.ts";
+import type { CommandAction, CommandJob } from "./job.ts";
 
-interface CommandResult {
+export interface CommandResult {
   /** The confirmation shown to the invoker (only they see it). */
   content: string;
   /**
    * What goes with the result: Assign to's menu, or the Manage panel drawn again with the ticket as
    * it is now (a Components V2 message; see respond in hub.ts).
    */
-  components?: APIMessageTopLevelComponent[];
+  components?: APIMessageTopLevelComponent[] | undefined;
   /** Chatwoot could not find the conversation: it may have been deleted. */
   conversationGone: boolean;
+  confirmed?: boolean | undefined;
 }
 
-/** Never throws. */
-export async function executeCommand(job: CommandJob, settings: Settings, fetch: Fetch): Promise<CommandResult> {
+export interface CommandExecution {
+  settings: Settings;
+  fetch: Fetch;
+  limits?: RateLimitStore;
+  retryable?: () => boolean;
+  confirmUnknown?: (chatwoot: ChatwootClient, action: CommandAction) => Promise<string | undefined>;
+  deferPanel?: boolean;
+  attachment?: (
+    file: CommandJob["action"] & { type: "message" },
+    index: number,
+  ) => Promise<{ blob: Blob; filename: string }>;
+}
+
+export async function executeCommand(job: CommandJob, execution: CommandExecution): Promise<CommandResult> {
+  const { settings, fetch, limits, retryable, confirmUnknown, attachment, deferPanel = false } = execution;
   // The link is checked again here: it may have changed since the command was queued.
   const chatwootUserId = settings.chatwootUserFor(job.discordUserId);
   const token = settings.agentToken(job.discordUserId);
   if (chatwootUserId === undefined || !token) return { content: `❌ ${NOT_LINKED}`, conversationGone: false };
-  const chatwoot = chatwootClient(settings.config.chatwoot.baseUrl, token, fetch);
+  const chatwoot = chatwootClient(settings.config.chatwoot.baseUrl, token, fetch, limits);
   const { accountId, conversationId, action } = job;
 
   try {
@@ -56,23 +73,26 @@ export async function executeCommand(job: CommandJob, settings: Settings, fetch:
       case "panel":
         break;
       case "pick-assignee": {
-        const conversation = await existing(chatwoot.getConversation(accountId, conversationId));
+        const [conversation, agents] = await parallel(
+          existing(chatwoot.getConversation(accountId, conversationId)),
+          chatwoot.listAgents(accountId),
+        );
         const ticket = `${settings.account(accountId)?.name ?? "Ticket"} #${conversationId}`;
         return {
           content: `👤 Assign **${ticket}** to:`,
-          components: assigneeMenu(
-            named(await chatwoot.listAgents(accountId)),
-            personAssignee(conversation)?.id ?? null,
-          ),
+          components: assigneeMenu(named(agents), personAssignee(conversation)?.id ?? null),
           conversationGone: false,
+          confirmed: true,
         };
       }
       case "labels": {
-        const known = await chatwoot.listLabels(accountId);
+        const [known, conversation] = await parallel(
+          chatwoot.listLabels(accountId),
+          existing(chatwoot.getConversation(accountId, conversationId)),
+        );
         const unknown = action.labels.find((label) => !known.includes(label));
         if (unknown !== undefined) throw new UserError(`There is no label "${unknown}" in this Chatwoot account.`);
         // The panel sets the topic label; the ticket's kinds stay.
-        const conversation = await existing(chatwoot.getConversation(accountId, conversationId));
         const kinds = kindLabels(settings);
         const kept = (conversation.labels ?? []).filter((label) => kinds.has(label) && !action.labels.includes(label));
         await chatwoot.setLabels(accountId, conversationId, [...action.labels, ...kept]);
@@ -139,9 +159,11 @@ export async function executeCommand(job: CommandJob, settings: Settings, fetch:
       case "label": {
         // Chatwoot sets a conversation's labels as a whole list.
         const { change, label } = action;
-        const current = await chatwoot.conversationLabels(accountId, conversationId);
+        const [current, known] = await parallel(
+          chatwoot.conversationLabels(accountId, conversationId),
+          change === "add" ? chatwoot.listLabels(accountId) : Promise.resolve([]),
+        );
         if (change === "add") {
-          const known = await chatwoot.listLabels(accountId);
           if (!known.includes(label)) throw new UserError(`There is no label "${label}" in this Chatwoot account.`);
           if (!current.includes(label)) await chatwoot.setLabels(accountId, conversationId, [...current, label]);
           message = `Label ${label} added.`;
@@ -157,6 +179,17 @@ export async function executeCommand(job: CommandJob, settings: Settings, fetch:
         break;
       }
       case "message": {
+        const limits = settings.config.attachments;
+        const files = [];
+        let total = 0;
+        for (const [index, file] of action.files.entries()) {
+          const downloaded = attachment
+            ? await attachment(action, index)
+            : await downloadAttachment(file, limits.maxFileBytes, fetch);
+          total += downloaded.blob.size;
+          if (total > limits.maxTotalBytes) throw filesTooLarge(limits.maxTotalBytes);
+          files.push(downloaded);
+        }
         if (!action.private) {
           const conversation = await existing(chatwoot.getConversation(accountId, conversationId));
           // Chatwoot accepts the message but the channel would fail it, e.g. after WhatsApp's
@@ -164,15 +197,6 @@ export async function executeCommand(job: CommandJob, settings: Settings, fetch:
           if (conversation.can_reply === false) throw new UserError(CANNOT_REPLY);
           // A public reply to an unassigned conversation assigns it to the replying agent.
           if (!personAssignee(conversation)) await chatwoot.assign(accountId, conversationId, profile.id);
-        }
-        const limits = settings.config.attachments;
-        const files = [];
-        let total = 0;
-        for (const file of action.files) {
-          const downloaded = await downloadAttachment(file, limits.maxFileBytes, fetch);
-          total += downloaded.blob.size;
-          if (total > limits.maxTotalBytes) throw filesTooLarge(limits.maxTotalBytes);
-          files.push(downloaded);
         }
         await chatwoot.createMessage(accountId, conversationId, {
           content: action.content,
@@ -187,18 +211,49 @@ export async function executeCommand(job: CommandJob, settings: Settings, fetch:
       }
     }
     log.info("command done", { action: action.type, discordUserId: job.discordUserId, accountId, conversationId });
-    if (job.panel === true || action.type === "panel") {
+    if ((job.panel === true && !deferPanel) || action.type === "panel") {
       const ticket = `${settings.account(accountId)?.name ?? "Ticket"} #${conversationId}`;
       return {
         content: message ? `✅ ${message}` : ticket,
         components: await drawPanel(chatwoot, accountId, conversationId, ticket, message, settings),
         conversationGone: false,
+        confirmed: true,
       };
     }
-    return { content: `✅ ${message}`, conversationGone: false };
+    return { content: `✅ ${message}`, conversationGone: false, confirmed: true };
   } catch (error) {
+    const tracked = typeof retryable === "function";
+    const canRetry = retryable?.() ?? false;
+    if (
+      tracked &&
+      !canRetry &&
+      ((error instanceof ChatwootError && error.status >= 500) ||
+        error instanceof TypeError ||
+        (error instanceof DOMException && ["TimeoutError", "AbortError"].includes(error.name)) ||
+        error instanceof JobDeadlineError)
+    ) {
+      const confirmed = await confirmUnknown?.(chatwoot, action);
+      if (confirmed !== undefined) return { content: `✅ ${confirmed}`, conversationGone: false, confirmed: true };
+      return { content: UNKNOWN_RESULT, conversationGone: false };
+    }
+    if (
+      tracked &&
+      canRetry &&
+      (error instanceof TypeError ||
+        error instanceof BudgetExhaustedError ||
+        error instanceof JobDeadlineError ||
+        (error instanceof DOMException && ["TimeoutError", "AbortError"].includes(error.name)) ||
+        (error instanceof ChatwootError && (error.status === 429 || error.status >= 500)))
+    )
+      throw error;
     const gone = error instanceof ConversationGoneError || (error instanceof ChatwootError && error.status === 404);
-    return { content: failure(error, job), conversationGone: gone };
+    return {
+      content:
+        tracked && !canRetry && !(error instanceof ChatwootError) && !(error instanceof UserError)
+          ? UNKNOWN_RESULT
+          : failure(error, job),
+      conversationGone: gone,
+    };
   }
 }
 
@@ -212,7 +267,11 @@ function failure(error: unknown, { action, accountId, conversationId }: CommandJ
   }
   log.error("command failed", { action: action.type, accountId, conversationId, ...errorFields(error) });
   // A request that timed out may still have been carried out.
-  if (error instanceof DOMException && error.name === "TimeoutError") return TIMED_OUT;
+  if (
+    error instanceof JobDeadlineError ||
+    (error instanceof DOMException && ["TimeoutError", "AbortError"].includes(error.name))
+  )
+    return TIMED_OUT;
   return FAILED;
 }
 
@@ -231,12 +290,15 @@ async function drawPanel(
   done: string,
   settings: Settings,
 ): Promise<APIMessageTopLevelComponent[]> {
-  const conversation = await existing(chatwoot.getConversation(accountId, conversationId));
-  const agents = await chatwoot.listAgents(accountId);
+  const [conversation, agents, known] = await parallel(
+    existing(chatwoot.getConversation(accountId, conversationId)),
+    chatwoot.listAgents(accountId),
+    chatwoot.listLabels(accountId),
+  );
   const kinds = kindLabels(settings);
   // Its label menu is for the topic: kinds are labels of their own (recorded by chatwoot-router).
   const topics = (labels: string[]) => labels.filter((label) => !kinds.has(label));
-  const labels = topics(await chatwoot.listLabels(accountId));
+  const labels = topics(known);
   // The customer's name is their own text: it must not mention anyone.
   const customer = defused(clip(conversation.meta?.sender?.name ?? "", CUSTOMER_NAME_LIMIT));
   const title = `### ${customer ? `${ticket} · ${customer}` : ticket}`;
@@ -259,7 +321,7 @@ function named(agents: Array<{ id?: number; name?: string }>): Array<{ id: numbe
   );
 }
 
-function statusMessage(status: StatusChange["status"], snoozedUntil: number | undefined): string {
+export function statusMessage(status: StatusChange["status"], snoozedUntil: number | undefined): string {
   switch (status) {
     case "open":
       return "Reopened.";
@@ -296,4 +358,22 @@ async function existing<T>(conversation: Promise<T | undefined>): Promise<T> {
 
 function kindLabels(settings: Settings): ReadonlySet<string> {
   return new Set(settings.config.router?.keepLabels ?? []);
+}
+
+export async function commandPanel(
+  job: CommandJob,
+  result: CommandResult,
+  settings: Settings,
+  fetch: Fetch,
+  limits?: RateLimitStore,
+): Promise<APIMessageTopLevelComponent[] | undefined> {
+  if (!job.panel || result.components || result.confirmed !== true) return undefined;
+  const token = settings.agentToken(job.discordUserId);
+  const userId = settings.chatwootUserFor(job.discordUserId);
+  if (!token || userId === undefined) return undefined;
+  const chatwoot = chatwootClient(settings.config.chatwoot.baseUrl, token, fetch, limits);
+  const profile = await chatwoot.getProfile();
+  if (profile.id !== userId || !profile.accounts?.some((account) => account.id === job.accountId)) return undefined;
+  const ticket = `${settings.account(job.accountId)?.name ?? "Ticket"} #${job.conversationId}`;
+  return drawPanel(chatwoot, job.accountId, job.conversationId, ticket, result.content.slice(2).trim(), settings);
 }

@@ -18,6 +18,9 @@ may point to another deployment of that API, for example a proxy or gateway.
   must see every routed inbox. Disconnecting an inbox stops classification/replies and hands any pending ticket still assigned to this bot to people. The API does not expose whether the
   association is inactive; disconnect to disable it. `routing.botIds` and both bot credential maps require
   exactly the routed account keys (see [Configuration reference](#configuration-reference)).
+- Each account+conversation has its own SQLite `Router` Durable Object: its queue, memo, reply records and turn
+  guards have one writer. A slow conversation cannot occupy another conversation’s alarm. A separate `Coordinator`
+  Durable Object pages the account lists and durably enqueues each conversation in its own object.
 - Signed bot webhooks at `/chatwoot/agent-bot` enqueue a deduplicated conversation job. The five-minute sweep
   lists only **pending and open conversations in the account**, including disconnected inboxes, without an age
   cutoff. Pending tickets route or hand off; open tickets still assigned to the brand bot release that assignment
@@ -29,7 +32,7 @@ may point to another deployment of that API, for example a proxy or gateway.
   The latest `conversation_status_changed` activity begins the turn; without one or evidence it is missing, use
   the conversation's start. Take the first three usable customer texts after the boundary, oldest first. Include
   email subjects and reply text without quoted history; omit automatic email, deleted messages and private notes.
-  Redact identifiers and contact names, then cap the input at 1,600 characters. Memoize Jev's decision by input ids.
+  Redact identifiers and contact names, then cap the input at 1,600 characters. Memoize Jev's decision by account, conversation, input ids, actual redacted input and routing configuration/model.
 - Status activity is asynchronous. The queue's boundary guard remembers an observed/expected transition and the
   last boundary needed to reject stale handoff work. An activity read before its first status webhook can match
   that webhook's status and time only if no existing expectation requires a newer activity. Merging a webhook
@@ -120,7 +123,7 @@ npx cf deploy --prebuilt --dry-run
 Edit `cloudflare.config.ts` with your non-secret settings. Keep required secrets out of source control;
 `.dev.vars.example` lists placeholders. For local development copy it to `.dev.vars` and use `npm run dev`.
 A maintainer deploys with `npx cf deploy --secrets-file <private-file>`.
-The default Worker name is `chatwoot-router`; it exports one SQLite Durable Object, `Router`, bound as `ROUTER`.
+The default Worker name is `chatwoot-router`; it exports SQLite Durable Objects `Router` (bound as `ROUTER`) and `Coordinator` (bound as `COORDINATOR`).
 Keep the `*/5 * * * *` cron trigger for reconciliation. `GET /healthz` returns 200 for a valid, readable
 configuration and 503 otherwise; it does not test upstream credentials or connectivity.
 
@@ -128,12 +131,12 @@ For a private deployment repository, depend on the public `chatwoot-router` npm 
 `@cloudflare/vite-plugin`. Its Worker entry is:
 
 ```ts
-export { default, Router } from "chatwoot-router";
+export { default, Router, Coordinator } from "chatwoot-router";
 ```
 
 Use the same `cloudflare.config.ts` and `vite.config.ts` structure as this package. Pin compatible tooling versions
-from the workspace and root manifests. Declare `Router` with `exports.durableObject({ storage: "sqlite" })`, bind it as
-`ROUTER`, declare required secrets with `bindings.secret()`, and put `CONFIG` in `bindings.json(...)`.
+from the workspace and root manifests. Declare `Router` and `Coordinator` with `exports.durableObject({ storage: "sqlite" })`, bind it as
+`ROUTER` and `COORDINATOR` respectively, declare required secrets with `bindings.secret()`, and put `CONFIG` in `bindings.json(...)`.
 
 For a configuration larger than a Worker JSON binding, use immutable KV configuration instead:
 
@@ -218,10 +221,12 @@ fail startup; `/healthz` returns 503 without credentials in its response. All se
 
 ## Upgrade and rollback
 
+0.2.x was never deployed, so the conversation partition and coordinator require no state migration.
+
 Keep Worker names, Durable Object namespaces/storage and old KV configuration keys. The Router DO holds
 permanent reply attempts/observed records and turn guards as well as jobs and decisions. Message history cannot
 rebuild an unknown attempt, an observed reply since deleted, or a missing turn boundary. Do not delete or recreate
-the Router DO during rollback. If its state is lost or restored to an older recovery point, keep bots disconnected
+any conversation’s Router DO during rollback. If its state is lost or restored to an older recovery point, keep bots disconnected
 and isolate conversations with uncertain attempts/turns for owner review; a currently empty history does not
 prove another send is safe. Existing pending conversations are reconciled; non-pending conversations stay with people. The user token must see all relevant inboxes.
 
